@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+    branches:
+      - master
+
+jobs:
+  release:
+    permissions:
+      contents: write
+
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v5
+      with:
+        fetch-depth: 0
+
+    - name: Set up Go
+      uses: actions/setup-go@v6
+      with:
+        go-version: '1.25.0'
+    - run: go version
+
+    - name: Get version
+      id: get_version
+      run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+    - name: Build for Linux AMD64
+      run: |
+        GOOS=linux GOARCH=amd64 CGO_ENABLE=0 go build -ldflags "-s -w" -o s6cmd-linux-amd64 .
+
+    - name: Build for Linux ARM64
+      run: |
+        GOOS=linux GOARCH=arm64 CGO_ENABLE=0 go build -ldflags "-s -w" -o s6cmd-linux-arm64 .
+
+    - name: Build for Windows AMD64
+      run: |
+        GOOS=windows GOARCH=amd64 CGO_ENABLE=0 go build -ldflags "-s -w" -o s6cmd-windows-amd64.exe .
+
+    - name: Build for Windows ARM64
+      run: |
+        GOOS=windows GOARCH=arm64 CGO_ENABLE=0 go build -ldflags "-s -w" -o s6cmd-windows-arm64.exe .
+
+    - name: Build for macOS AMD64
+      run: |
+        GOOS=darwin GOARCH=amd64 CGO_ENABLE=0 go build -ldflags "-s -w" -o s6cmd-darwin-amd64 .
+
+    - name: Build for macOS ARM64
+      run: |
+        GOOS=darwin GOARCH=arm64 CGO_ENABLE=0 go build -ldflags "-s -w" -o s6cmd-darwin-arm64 .
+
+    - name: Create checksums
+      run: |
+        sha256sum s6cmd-* > checksums.txt
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ steps.get_version.outputs.VERSION }}
+        name: Release ${{ steps.get_version.outputs.VERSION }}
+        draft: false
+        prerelease: false
+        generate_release_notes: true
+        files: |
+          s6cmd-linux-amd64
+          s6cmd-linux-arm64
+          s6cmd-windows-amd64.exe
+          s6cmd-windows-arm64.exe
+          s6cmd-darwin-amd64
+          s6cmd-darwin-arm64
+          checksums.txt
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
