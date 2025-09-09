@@ -86,6 +86,12 @@ func (o *Options) run() error {
 	if err != nil {
 		return err
 	}
+	if o.localFile == "-" {
+		if _, err := s.UploadFromStdin(context.TODO(), parsedUri.GetBucket(), parsedUri.GetKey()); err != nil {
+			return err
+		}
+		return nil
+	}
 
 	if _, err := s.UploadFile(context.TODO(), o.localFile, parsedUri.GetBucket(), parsedUri.GetKey()); err != nil {
 		return err
