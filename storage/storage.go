@@ -10,6 +10,7 @@ import (
 
 	fsstore "github.com/LinPr/s6cmd/storage/fs"
 	s3store "github.com/LinPr/s6cmd/storage/s3"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
@@ -137,6 +138,11 @@ func (s *Storage) DownloadFile(ctx context.Context, bucketName string, objectKey
 	}
 	defer result.Body.Close()
 
+	if localFile == "" || localFile == "-" {
+		_, err = io.Copy(os.Stdout, result.Body)
+		return err
+	}
+
 	file, err := s.local.Create(localFile)
 	if err != nil {
 		log.Printf("Couldn't create file %v. err: %v\n", localFile, err)
@@ -148,14 +154,33 @@ func (s *Storage) DownloadFile(ctx context.Context, bucketName string, objectKey
 	return err
 }
 
-func (s *Storage) UploadFile(ctx context.Context, fileName string, bucketName string, objectKey string) (*s3.PutObjectOutput, error) {
+// stdin is an io.Reader adapter for os.File, enabling it to function solely as
+// an io.Reader. The AWS SDK, which accepts an io.Reader for multipart uploads,
+// will attempt to use io.Seek if the reader supports it. However, os.Stdin is
+// a specific type of file that can not seekable.
+type stdin struct {
+	file *os.File
+}
 
+func (s *stdin) Read(p []byte) (n int, err error) {
+	return s.file.Read(p)
+}
+
+// func (s *stdin) Seek(offset int64, whence int) (int64, error) {
+// 	return s.file.Seek(offset, whence)
+// }
+
+func (s *Storage) UploadFile(ctx context.Context, fileName string, bucketName string, objectKey string) (*s3.PutObjectOutput, error) {
 	file, err := s.local.Create(fileName)
 	if err != nil {
 		return nil, err
 	}
-
 	defer file.Close()
-	return s.remote.PutObject(ctx, file, bucketName, objectKey)
 
+	return s.remote.PutObject(ctx, file, bucketName, objectKey)
+}
+
+func (s *Storage) UploadFromStdin(ctx context.Context, bucketName string, objectKey string) (*manager.UploadOutput, error) {
+	stdinReader := &stdin{file: os.Stdin}
+	return s.remote.UploadObject(ctx, stdinReader, bucketName, objectKey)
 }

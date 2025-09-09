@@ -93,7 +93,7 @@ func (o *Options) run() error {
 		return listBuckets(cli)
 	}
 
-	return listObjects(cli, o.S3Uri)
+	return listObjects(cli, parsedUri.GetBucket(), parsedUri.GetKey())
 }
 
 func listBuckets(cli *s3store.S3Store) error {
@@ -107,8 +107,8 @@ func listBuckets(cli *s3store.S3Store) error {
 	return nil
 }
 
-func listObjects(cli *s3store.S3Store, s3uri string) error {
-	objs, err := cli.ListObjects(context.TODO(), s3uri)
+func listObjects(cli *s3store.S3Store, bucket, key string) error {
+	objs, err := cli.ListObjects(context.TODO(), bucket, key)
 	if err != nil {
 		return err
 	}
