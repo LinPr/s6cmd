@@ -8,6 +8,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
@@ -30,7 +31,8 @@ type Options struct {
 }
 
 type S3Store struct {
-	client *s3.Client
+	client   *s3.Client
+	uploader *manager.Uploader
 }
 
 func NewS3Client(ctx context.Context) (*S3Store, error) {
@@ -57,26 +59,20 @@ func NewS3Client(ctx context.Context) (*S3Store, error) {
 	// provider := NewAwsS3Provider(envCredential)
 
 	// Load default config with custom endpoint resolver
-	conf, err := config.LoadDefaultConfig(ctx,
-		config.WithRegion("cn-hangzhou"),
-		// config.WithEndpointResolverWithOptions(customResolver),
-		// config.WithCredentialsProvider(provider),
-	)
+	conf, err := config.LoadDefaultConfig(ctx) // config.WithRegion("cn-hangzhou"),
+	// config.WithEndpointResolverWithOptions(customResolver),
+	// config.WithCredentialsProvider(provider),
+
 	if err != nil {
 		return nil, err
 	}
 
 	client := s3.NewFromConfig(conf)
 
-	// sdkConfig, err := s3.LoadDefaultConfig(ctx, s3.WithEndpointResolverV2(customResolver))
-	// if err != nil {
-	// 	return nil, err
-	// }
-
-	// client := s3.NewFromConfig(sdkConfig)
-
+	uploader := manager.NewUploader(client)
 	return &S3Store{
-		client: client,
+		client:   client,
+		uploader: uploader,
 	}, nil
 }
 

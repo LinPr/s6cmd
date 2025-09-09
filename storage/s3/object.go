@@ -10,8 +10,6 @@ import (
 	"os"
 	"time"
 
-	"github.com/LinPr/s6cmd/storage/uri"
-
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -217,15 +215,11 @@ func (s3store *S3Store) DeleteObjects(ctx context.Context, bucketName string, ob
 	return err
 }
 
-func (s3store *S3Store) ListObjects(ctx context.Context, s3uri string) (*s3.ListObjectsV2Output, error) {
-	parsedUri, err := uri.ParseS3Url(s3uri)
-	if err != nil {
-		return nil, err
-	}
+func (s3store *S3Store) ListObjects(ctx context.Context, bucket, key string) (*s3.ListObjectsV2Output, error) {
 
 	return s3store.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-		Bucket: aws.String(parsedUri.GetBucket()),
-		Prefix: aws.String(parsedUri.GetKey()),
+		Bucket: aws.String(bucket),
+		Prefix: aws.String(key),
 	})
 }
 
@@ -274,6 +268,15 @@ func (s3store *S3Store) PutObject(ctx context.Context, r io.Reader, bucketName s
 	}
 
 	return output, err
+}
+
+func (s3store *S3Store) UploadObject(ctx context.Context, reader io.Reader, bucketName string, key string) (*manager.UploadOutput, error) {
+	return s3store.uploader.Upload(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(bucketName),
+		Key:    aws.String(key),
+		Body:   reader,
+	})
+
 }
 
 func (s3store *S3Store) HeadObject(ctx context.Context, bucketName string, objectKey string) (*s3.HeadObjectOutput, error) {
