@@ -117,12 +117,12 @@ type Storage struct {
 	local  *fsstore.FileStore
 }
 
-func NewStorage(ctx context.Context) (*Storage, error) {
-	s3client, err := s3store.NewS3Client(ctx)
+func NewStorage(ctx context.Context, option StorageOption) (*Storage, error) {
+	s3client, err := s3store.NewS3Client(ctx, option.s3Option)
 	if err != nil {
 		return nil, err
 	}
-	fs := fsstore.NewFileStore()
+	fs := fsstore.NewFileStore(ctx, option.localOption)
 
 	return &Storage{
 		remote: s3client,

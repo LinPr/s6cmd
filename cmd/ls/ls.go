@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"time"
 
 	s3store "github.com/LinPr/s6cmd/storage/s3"
 	"github.com/LinPr/s6cmd/storage/uri"
@@ -18,6 +19,7 @@ func NewLsCmd() *cobra.Command {
 		Use:   "ls [flags] <target>",
 		Short: "list buckets and objects",
 		// Args:  cobra.ExactArgs(1),
+		Example: ls_examples,
 		Run: func(cmd *cobra.Command, args []string) {
 			if len(args) > 0 {
 				o.S3Uri = args[0]
@@ -46,7 +48,9 @@ type Args struct {
 	S3Uri string `validate:"omitempty"`
 }
 type Flags struct {
-	DryRun bool `json:"DryRun" yaml:"DryRun"`
+	DryRun    bool   `json:"DryRun" yaml:"DryRun"`
+	Region    string `json:"Region" yaml:"Region"`
+	Summarize string `json:"Summarize" yaml:"Summarize"`
 }
 
 type Options struct {
@@ -75,8 +79,9 @@ func (o *Options) run() error {
 	j, _ := json.Marshal(o)
 	fmt.Fprintf(os.Stdout, "options: %s\n", string(j))
 	// return nil
+	opt := s3store.S3Option{}
 
-	cli, err := s3store.NewS3Client(context.TODO())
+	cli, err := s3store.NewS3Client(context.TODO(), opt)
 	if err != nil {
 		return err
 	}
@@ -85,7 +90,7 @@ func (o *Options) run() error {
 		return listBuckets(cli)
 	}
 
-	parsedUri, err := uri.ParseS3Url(o.S3Uri)
+	parsedUri, err := uri.ParseS3Uri(o.S3Uri)
 	if err != nil {
 		return err
 	}
@@ -102,18 +107,18 @@ func listBuckets(cli *s3store.S3Store) error {
 		return err
 	}
 	for _, bucket := range buckets {
-		fmt.Printf("\t%v\n", *bucket.Name)
+		fmt.Printf("%s\t%s\n", bucket.CreationDate.Format(time.DateTime), *bucket.Name)
 	}
 	return nil
 }
 
 func listObjects(cli *s3store.S3Store, bucket, key string) error {
-	objs, err := cli.ListObjects(context.TODO(), bucket, key)
+	_, err := cli.ListObjectsWithPagination(context.TODO(), bucket, key)
 	if err != nil {
 		return err
 	}
-	for _, obj := range objs.Contents {
-		fmt.Printf("\t%v\n", *obj.Key)
-	}
+	// for _, obj := range objs.Contents {
+	// 	fmt.Printf("\t%v\n", *obj.Key)
+	// }
 	return nil
 }

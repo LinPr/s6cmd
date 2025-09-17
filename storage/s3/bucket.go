@@ -47,7 +47,7 @@ func (s3store *S3Store) BucketExists(ctx context.Context, bucketName string) (bo
 		if errors.As(err, &apiError) {
 			switch apiError.(type) {
 			case *types.NotFound:
-				log.Printf("Bucket %v is available.\n", bucketName)
+				log.Printf("Create Bucket %v is available.\n", bucketName)
 				exists = false
 				err = nil
 			default:
@@ -81,11 +81,9 @@ func (s3store *S3Store) CreateBucket(ctx context.Context, name string, region st
 		}
 		return err
 	}
-
+	log.Println("Waiting for bucket to be created...")
 	waiter := s3.NewBucketExistsWaiter(s3store.client)
-
 	return waiter.Wait(ctx, &s3.HeadBucketInput{Bucket: aws.String(name)}, time.Minute)
-
 }
 
 // DeleteBucket deletes a bucket. The bucket must be empty or an error is returned.

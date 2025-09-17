@@ -78,12 +78,12 @@ func (o *Options) run() error {
 	fmt.Fprintf(os.Stdout, "options: %s\n", string(j))
 	// return nil
 
-	parsedUri, err := uri.ParseS3Url(o.S3Uri)
+	parsedUri, err := uri.ParseS3Uri(o.S3Uri)
 	if err != nil {
 		return err
 	}
-
-	store, err := storage.NewStorage(context.TODO())
+	opt := storage.StorageOption{}
+	store, err := storage.NewStorage(context.TODO(), opt)
 	if err != nil {
 		return err
 	}

@@ -6,7 +6,7 @@ import (
 	"github.com/LinPr/s6cmd/storage/uri"
 )
 
-func TestParseS3Url(t *testing.T) {
+func TestParseS3Uri(t *testing.T) {
 	tests := []struct {
 		name string // description of this test case
 		// Named input parameters for target function.
@@ -21,9 +21,9 @@ func TestParseS3Url(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := uri.ParseS3Url(tt.s)
+			got, err := uri.ParseS3Uri(tt.s)
 			if (err != nil) != false {
-				t.Errorf("ParseS3Url() error = %v, wantErr %v", err, false)
+				t.Errorf("ParseS3Uri() error = %v, wantErr %v", err, false)
 				return
 			}
 			t.Logf("got: %v", got)
