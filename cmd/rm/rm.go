@@ -77,12 +77,12 @@ func (o *Options) run() error {
 	fmt.Fprintf(os.Stdout, "options: %s\n", string(j))
 	// return nil
 
-	cli, err := s3store.NewS3Client(context.TODO())
+	cli, err := s3store.NewS3Client(context.TODO(), s3store.S3Option{})
 	if err != nil {
 		return err
 	}
 
-	parsedUri, err := uri.ParseS3Url(o.S3Uri)
+	parsedUri, err := uri.ParseS3Uri(o.S3Uri)
 	if err != nil {
 		return err
 	}

@@ -215,12 +215,32 @@ func (s3store *S3Store) DeleteObjects(ctx context.Context, bucketName string, ob
 	return err
 }
 
-func (s3store *S3Store) ListObjects(ctx context.Context, bucket, key string) (*s3.ListObjectsV2Output, error) {
-
-	return s3store.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-		Bucket: aws.String(bucket),
-		Prefix: aws.String(key),
+func (S3Store *S3Store) ListObjectsWithPagination(ctx context.Context, bucket, key string) ([]types.Object, error) {
+	paginator := s3.NewListObjectsV2Paginator(S3Store.client, &s3.ListObjectsV2Input{
+		Bucket:       aws.String(bucket),
+		Prefix:       aws.String(key),
+		MaxKeys:      aws.Int32(1000),             // The maximum number of keys that can be returned in a single request is 1000.
+		Delimiter:    aws.String("/"),             // Setting a delimiter causes keys that contain the same string between the prefix and the first occurrence of the delimiter to be rolled up into a single result element in CommonPrefixes.
+		RequestPayer: types.RequestPayerRequester, // Confirms that the requester knows that they will be charged for the request. Bucket owners need not specify this parameter in their requests.
 	})
+	var objects []types.Object
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		// 前缀
+		for _, prefix := range page.CommonPrefixes {
+			fmt.Printf("Prefix: %s\n", *prefix.Prefix)
+		}
+		objects = append(objects, page.Contents...)
+	}
+	fmt.Printf("Total objects found: %d\n", len(objects))
+	for _, obj := range objects {
+		fmt.Printf("%s %10d %s\n", obj.LastModified.Format(time.DateTime), obj.Size, *obj.Key)
+	}
+	return objects, nil
 }
 
 func (s3store *S3Store) GetObject(ctx context.Context, bucketName string, objectKey string) (*s3.GetObjectOutput, error) {

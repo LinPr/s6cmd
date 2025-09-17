@@ -12,30 +12,14 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
-// Options stores configuration for storage.
-type Options struct {
-	MaxRetries             int
-	NoSuchUploadRetryCount int
-	Endpoint               string
-	NoVerifySSL            bool
-	DryRun                 bool
-	NoSignRequest          bool
-	UseListObjectsV1       bool
-	// LogLevel               log.LogLevel
-	RequestPayer    string
-	Profile         string
-	CredentialFile  string
-	bucket          string
-	region          string
-	AddressingStyle string
-}
-
 type S3Store struct {
-	client   *s3.Client
-	uploader *manager.Uploader
+	client     *s3.Client
+	uploader   *manager.Uploader
+	downloader *manager.Downloader
 }
 
-func NewS3Client(ctx context.Context) (*S3Store, error) {
+func NewS3Client(ctx context.Context, option S3Option) (*S3Store, error) {
+
 	// customResolver2 := s3.EndpointResolverFunc(func(region string, options s3.EndpointResolverOptions) (aws.Endpoint, error) {
 	// 	return aws.Endpoint{
 	// 		URL:           "http://oss-cn-hangzhou.aliyuncs.com",
@@ -59,7 +43,14 @@ func NewS3Client(ctx context.Context) (*S3Store, error) {
 	// provider := NewAwsS3Provider(envCredential)
 
 	// Load default config with custom endpoint resolver
-	conf, err := config.LoadDefaultConfig(ctx) // config.WithRegion("cn-hangzhou"),
+
+	var optFns []func(*config.LoadOptions) error
+	if option.Region != "" {
+		optFns = append(optFns, config.WithRegion(option.Region))
+	}
+
+	conf, err := config.LoadDefaultConfig(ctx, optFns...)
+	// config.WithRegion("cn-hangzhou"),
 	// config.WithEndpointResolverWithOptions(customResolver),
 	// config.WithCredentialsProvider(provider),
 
@@ -68,11 +59,13 @@ func NewS3Client(ctx context.Context) (*S3Store, error) {
 	}
 
 	client := s3.NewFromConfig(conf)
-
 	uploader := manager.NewUploader(client)
+	downloader := manager.NewDownloader(client)
+
 	return &S3Store{
-		client:   client,
-		uploader: uploader,
+		client:     client,
+		uploader:   uploader,
+		downloader: downloader,
 	}, nil
 }
 

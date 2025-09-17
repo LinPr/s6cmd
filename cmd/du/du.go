@@ -46,7 +46,8 @@ type Args struct {
 	S3Uri string `validate:"omitempty"`
 }
 type Flags struct {
-	DryRun bool `json:"DryRun" yaml:"DryRun"`
+	DryRun bool    `json:"DryRun" yaml:"DryRun"`
+	Region *string `json:"Region" yaml:"Region"`
 }
 
 type Options struct {
@@ -76,12 +77,16 @@ func (o *Options) run() error {
 	fmt.Fprintf(os.Stdout, "options: %s\n", string(j))
 	// return nil
 
-	cli, err := s3store.NewS3Client(context.TODO())
+	opt := s3store.S3Option{
+		Region: *o.Region,
+	}
+
+	cli, err := s3store.NewS3Client(context.TODO(), opt)
 	if err != nil {
 		return err
 	}
 
-	parsedUri, err := uri.ParseS3Url(o.S3Uri)
+	parsedUri, err := uri.ParseS3Uri(o.S3Uri)
 	if err != nil {
 		return err
 	}
@@ -93,12 +98,13 @@ func (o *Options) run() error {
 }
 
 func listObjects(cli *s3store.S3Store, bucket, key string) error {
-	objs, err := cli.ListObjects(context.TODO(), bucket, key)
+	objs, err := cli.ListObjectsWithPagination(context.TODO(), bucket, key)
 	if err != nil {
 		return err
 	}
 	var size int64
-	for _, obj := range objs.Contents {
+
+	for _, obj := range objs {
 		size += *obj.Size
 	}
 	unit := "bytes"

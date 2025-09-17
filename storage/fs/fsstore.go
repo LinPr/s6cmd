@@ -1,11 +1,14 @@
 package fsstore
 
-import "os"
+import (
+	"context"
+	"os"
+)
 
 type FileStore struct {
 }
 
-func NewFileStore() *FileStore {
+func NewFileStore(ctx context.Context, option LocalOption) *FileStore {
 	return &FileStore{}
 }
 

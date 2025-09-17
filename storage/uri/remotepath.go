@@ -5,35 +5,37 @@ import (
 	"strings"
 )
 
-type S3Url struct {
+type S3Uri struct {
 	scheme string
 	bucket string
 	key    string
 }
 
-func (rp S3Url) GetScheme() string {
+func (rp S3Uri) GetScheme() string {
 	return rp.scheme
 }
 
-func (rp S3Url) GetKey() string {
+func (rp S3Uri) GetKey() string {
 	return rp.key
 }
 
-func (rp S3Url) GetBucket() string {
+func (rp S3Uri) GetBucket() string {
 	return rp.bucket
 }
 
-func ParseS3Url(s string) (*S3Url, error) {
-	scheme, rest, found := strings.Cut(s, "://")
-	if !found {
-		return nil, fmt.Errorf("invalid s3 url: %s", s)
-	}
-	if scheme != "s3" {
-		return nil, fmt.Errorf("invalid scheme: %s", scheme)
-	}
-	bucket, key, _ := strings.Cut(rest, "/")
+func (rp S3Uri) GetPath() string {
+	return fmt.Sprintf("%s/%s", rp.bucket, rp.key)
+}
 
-	return &S3Url{
+func ParseS3Uri(s string) (*S3Uri, error) {
+	if !strings.HasPrefix(s, "s3://") {
+		return nil, fmt.Errorf("s3 url must start with s3://")
+	}
+
+	scheme, s3path, _ := strings.Cut(s, "://")
+	bucket, key, _ := strings.Cut(s3path, "/")
+
+	return &S3Uri{
 		scheme: scheme,
 		bucket: bucket,
 		key:    key,

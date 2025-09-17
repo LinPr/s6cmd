@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 
 	s3store "github.com/LinPr/s6cmd/storage/s3"
+	"github.com/LinPr/s6cmd/storage/uri"
 	"github.com/go-playground/validator/v10"
 	"github.com/spf13/cobra"
 )
@@ -14,11 +16,12 @@ import (
 func NewMbCmd() *cobra.Command {
 	o := newOptions()
 	cmd := cobra.Command{
-		Use:   "mb [flags] <bucket-name>",
-		Short: "create a new S3 bucket",
-		Args:  cobra.ExactArgs(1),
+		Use:     "mb <s3uri>",
+		Short:   "Creates an S3 bucket.",
+		Args:    cobra.ExactArgs(1),
+		Example: mb_examples,
 		Run: func(cmd *cobra.Command, args []string) {
-			o.BucketName = args[0]
+			o.S3Uri = args[0]
 			if err := o.complete(); err != nil {
 				fmt.Fprintf(os.Stderr, "err: %v\n", err)
 				return
@@ -41,7 +44,7 @@ func NewMbCmd() *cobra.Command {
 }
 
 type Args struct {
-	BucketName string `validate:"required"`
+	S3Uri string `validate:"required"`
 }
 type Flags struct {
 	DryRun bool   `json:"DryRun" yaml:"DryRun"`
@@ -66,6 +69,13 @@ func (o *Options) validate() error {
 	if err := validator.New().Struct(o); err != nil {
 		return err
 	}
+	s3uri, err := uri.ParseS3Uri(o.S3Uri)
+	if err != nil {
+		return err
+	}
+	if s3uri.GetBucket() == "" {
+		return fmt.Errorf("bucket name is required in s3uri")
+	}
 
 	return nil
 }
@@ -76,18 +86,24 @@ func (o *Options) run() error {
 	fmt.Fprintf(os.Stdout, "options: %s\n", string(j))
 	// return nil
 
-	cli, err := s3store.NewS3Client(context.TODO())
+	cli, err := s3store.NewS3Client(context.TODO(), s3store.S3Option{})
 	if err != nil {
 		return err
 	}
-	exist, err := cli.BucketExists(context.TODO(), o.BucketName)
+
+	parsedUri, _ := uri.ParseS3Uri(o.S3Uri)
+
+	exist, err := cli.BucketExists(context.TODO(), parsedUri.GetBucket())
 	if err != nil {
 		return err
 	}
 	if exist {
-		fmt.Printf("Bucket %s already exists.\n", o.BucketName)
+		fmt.Printf("Bucket %s already exists.\n", parsedUri.GetBucket())
 	}
 
-	o.Region = "cn-east-3"
-	return cli.CreateBucket(context.TODO(), o.BucketName, o.Region)
+	if err := cli.CreateBucket(context.TODO(), parsedUri.GetBucket(), o.Region); err != nil {
+		log.Println("Create bucket error:", err)
+	}
+
+	return nil
 }
