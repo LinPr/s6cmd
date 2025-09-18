@@ -37,6 +37,7 @@ func NewStatCmd() *cobra.Command {
 	}
 
 	cmd.Flags().BoolVarP(&o.DryRun, "dryRun", "n", false, "show what would be transferred")
+	cmd.Flags().BoolVarP(&o.UsePathStyle, "usePathStyle", "", false, "force to use path style addressing")
 
 	return &cmd
 }
@@ -45,7 +46,8 @@ type Args struct {
 	S3Uri string `validate:"omitempty"`
 }
 type Flags struct {
-	DryRun bool `json:"DryRun" yaml:"DryRun"`
+	UsePathStyle bool `json:"UsePathStyle" yaml:"UsePathStyle"`
+	DryRun       bool `json:"DryRun" yaml:"DryRun"`
 }
 
 type Options struct {
@@ -75,7 +77,10 @@ func (o *Options) run() error {
 	fmt.Fprintf(os.Stdout, "options: %s\n", string(j))
 	// return nil
 
-	cli, err := s3store.NewS3Client(context.TODO(), s3store.S3Option{})
+	cli, err := s3store.NewS3Client(context.TODO(), s3store.S3Option{
+		UsePathStyle: o.UsePathStyle,
+	})
+
 	if err != nil {
 		return err
 	}

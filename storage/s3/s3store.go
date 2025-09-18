@@ -57,8 +57,13 @@ func NewS3Client(ctx context.Context, option S3Option) (*S3Store, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	client := s3.NewFromConfig(conf)
+	fmt.Printf("option.UsePathStyle: %v\n", option.UsePathStyle)
+	client := s3.NewFromConfig(conf,
+		func(o *s3.Options) {
+			o.UsePathStyle = option.UsePathStyle
+			o.Region = option.Region
+		},
+	)
 	uploader := manager.NewUploader(client)
 	downloader := manager.NewDownloader(client)
 

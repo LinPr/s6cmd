@@ -3,7 +3,8 @@ package s3store
 // Options stores configuration for storage.
 type S3Option struct {
 	// 已实现
-	Region string
+	Region       string
+	UsePathStyle bool
 
 	// 待实现
 	MaxRetries             int
