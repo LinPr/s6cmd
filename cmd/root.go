@@ -23,6 +23,13 @@ import (
 var ConfigFile string
 
 type Options struct {
+	EndpointUrl string
+	NoVerifySSL bool
+	NoPaginate  bool
+	Output      string
+	Profile     string
+	Region      string
+	PathStyle   bool
 }
 
 func NewOptions() *Options {
@@ -76,6 +83,14 @@ func NewRootCmd() *cobra.Command {
 	homeDir, _ := os.UserHomeDir()
 	defaultConfigPath := fmt.Sprintf("%s/.s6cmd.yaml", homeDir)
 	cmd.PersistentFlags().StringVar(&ConfigFile, "config", "", "default to "+defaultConfigPath)
+
+	cmd.PersistentFlags().StringVarP(&o.EndpointUrl, "endpoint-url", "e", "", "Override the default endpoint URL (or use AWS_ENDPOINT_URL_S3 environment variable)")
+	cmd.PersistentFlags().BoolVarP(&o.NoVerifySSL, "no-verify-ssl", "", false, "Disable SSL certificate verification (or use AWS_NO_VERIFY_SSL environment variable)")
+	cmd.PersistentFlags().BoolVarP(&o.NoPaginate, "no-paginate", "", false, "Disable automatic pagination of responses (or use AWS_NO_PAGINATE environment variable)")
+	cmd.PersistentFlags().StringVarP(&o.Output, "output", "o", "text", "Set output format. One of: json, text, table (or use AWS_OUTPUT environment variable)")
+	cmd.PersistentFlags().StringVarP(&o.Profile, "profile", "p", "", "Use a specific profile from your credential file (or use AWS_PROFILE environment variable)")
+	cmd.PersistentFlags().StringVarP(&o.Region, "region", "r", "", "The region to use. Overrides config/env settings (or use AWS_REGION environment variable)")
+	cmd.PersistentFlags().BoolVarP(&o.PathStyle, "path-style", "", false, "Force to use path style addressing (or use S6CMD_USE_PATH_STYLE environment variable)")
 
 	if err := viper.BindEnv("config", "S6CMD_CONFIG"); err != nil {
 		panic(err)
