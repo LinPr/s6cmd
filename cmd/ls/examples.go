@@ -10,7 +10,7 @@ const ls_examples = `Example 1: Listing all user owned buckets
        if  s3:// is used for the path argument <S3Uri>, it will  list  all  of
        the buckets as well.
 
-          aws s3 ls
+          s6cmd ls
 
        Output:
 
@@ -26,7 +26,7 @@ const ls_examples = `Example 1: Listing all user owned buckets
        mand has no interaction with the local filesystem, the s3:// URI scheme
        is not required to resolve ambiguity and may be omitted.
 
-          aws s3 ls s3://amzn-s3-demo-bucket
+          s6cmd ls s3://amzn-s3-demo-bucket
 
        Output:
 
@@ -40,7 +40,7 @@ const ls_examples = `Example 1: Listing all user owned buckets
        specified bucket and prefix.  However, there are no objects nor  common
        prefixes under the specified bucket and prefix.
 
-          aws s3 ls s3://amzn-s3-demo-bucket/noExistPrefix
+          s6cmd ls s3://amzn-s3-demo-bucket/noExistPrefix
 
        Output:
 
@@ -52,7 +52,7 @@ const ls_examples = `Example 1: Listing all user owned buckets
        Rather than showing PRE dirname/ in the output, all the  content  in  a
        bucket will be listed in order.
 
-          aws s3 ls s3://amzn-s3-demo-bucket \
+          s6cmd ls s3://amzn-s3-demo-bucket \
               --recursive
 
        Output:
@@ -75,7 +75,7 @@ const ls_examples = `Example 1: Listing all user owned buckets
        size  in  Bytes/MiB/KiB/GiB/TiB/PiB/EiB. --summarize displays the total
        number of objects and total size at the end of the result listing:
 
-          aws s3 ls s3://amzn-s3-demo-bucket \
+          s6cmd ls s3://amzn-s3-demo-bucket \
               --recursive \
               --human-readable \
               --summarize
@@ -101,7 +101,7 @@ const ls_examples = `Example 1: Listing all user owned buckets
        The following ls command list  objects  from  access  point  (myaccess-
        point):
 
-          aws s3 ls s3://arn:aws:s3:us-west-2:123456789012:accesspoint/myaccesspoint/
+          s6cmd ls s3://arn:aws:s3:us-west-2:123456789012:accesspoint/myaccesspoint/
 
        Output:
 

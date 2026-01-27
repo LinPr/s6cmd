@@ -2,7 +2,6 @@ package ls
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"time"
@@ -116,11 +115,13 @@ func (o *Options) validate() error {
 }
 
 func (o *Options) run() error {
-	j, _ := json.Marshal(o)
-	fmt.Fprintf(os.Stdout, "options: %s\n", string(j))
-	// return nil
+
 	opt := s3store.S3Option{
 		UsePathStyle: o.PathStyle,
+		Region:       o.Region,
+		Profile:      o.Profile,
+
+		NoVerifySSL: o.NoVerifySSL,
 	}
 
 	cli, err := s3store.NewS3Client(context.TODO(), opt)

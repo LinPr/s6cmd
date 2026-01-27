@@ -48,6 +48,9 @@ func NewS3Client(ctx context.Context, option S3Option) (*S3Store, error) {
 	if option.Region != "" {
 		optFns = append(optFns, config.WithRegion(option.Region))
 	}
+	if option.Profile != "" {
+		optFns = append(optFns, config.WithSharedConfigProfile(option.Profile))
+	}
 
 	conf, err := config.LoadDefaultConfig(ctx, optFns...)
 	// config.WithRegion("cn-hangzhou"),
@@ -57,11 +60,18 @@ func NewS3Client(ctx context.Context, option S3Option) (*S3Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	// test, err := config.LoadSharedConfigProfile(ctx, "default")
+	// if err != nil {
+	// 	log.Println("load shared config profile failed:", err)
+	// }
+
+	// j, _ := json.MarshalIndent(test, "", "  ")
+	// fmt.Printf("j: %v\n", string(j))
+
 	fmt.Printf("option.UsePathStyle: %v\n", option.UsePathStyle)
 	client := s3.NewFromConfig(conf,
 		func(o *s3.Options) {
 			o.UsePathStyle = option.UsePathStyle
-			o.Region = option.Region
 		},
 	)
 	uploader := manager.NewUploader(client)

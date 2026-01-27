@@ -8,6 +8,7 @@ import (
 	"os"
 	"sync"
 
+	"github.com/LinPr/s6cmd/cmd/cp"
 	"github.com/LinPr/s6cmd/cmd/du"
 	"github.com/LinPr/s6cmd/cmd/get"
 	"github.com/LinPr/s6cmd/cmd/ls"
@@ -154,4 +155,5 @@ func registerSubCommands(cmd *cobra.Command) {
 	cmd.AddCommand(put.NewPutCmd())
 	cmd.AddCommand(stat.NewStatCmd())
 	cmd.AddCommand(du.NewDuCmd())
+	cmd.AddCommand(cp.NewCpCmd())
 }

@@ -155,10 +155,14 @@ func (s3store *S3Store) CopyToFolder(ctx context.Context, bucketName string, obj
 
 // CopyToBucket copies an object in a bucket to another bucket.
 func (s3store *S3Store) CopyToBucket(ctx context.Context, sourceBucket string, destinationBucket string, objectKey string) error {
+	destObjectKey := objectKey
+	if sourceBucket == destinationBucket {
+		destObjectKey = objectKey + "_copy"
+	}
 	_, err := s3store.client.CopyObject(ctx, &s3.CopyObjectInput{
 		Bucket:     aws.String(destinationBucket),
 		CopySource: aws.String(fmt.Sprintf("%v/%v", sourceBucket, objectKey)),
-		Key:        aws.String(objectKey),
+		Key:        aws.String(destObjectKey),
 	})
 	if err != nil {
 		var notActive *types.ObjectNotInActiveTierError

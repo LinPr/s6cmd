@@ -5,6 +5,7 @@ type S3Option struct {
 	// 已实现
 	Region       string
 	UsePathStyle bool
+	Profile      string
 
 	// 待实现
 	MaxRetries             int
@@ -16,7 +17,6 @@ type S3Option struct {
 	UseListObjectsV1       bool
 	// LogLevel               log.LogLevel
 	RequestPayer    string
-	Profile         string
 	CredentialFile  string
 	bucket          string
 	AddressingStyle string

@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -10,6 +11,7 @@ import (
 
 	fsstore "github.com/LinPr/s6cmd/storage/fs"
 	s3store "github.com/LinPr/s6cmd/storage/s3"
+	"github.com/LinPr/s6cmd/storage/uri"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
@@ -183,4 +185,39 @@ func (s *Storage) UploadFile(ctx context.Context, fileName string, bucketName st
 func (s *Storage) UploadFromStdin(ctx context.Context, bucketName string, objectKey string) (*manager.UploadOutput, error) {
 	stdinReader := &stdin{file: os.Stdin}
 	return s.remote.UploadObject(ctx, stdinReader, bucketName, objectKey)
+}
+
+func (s *Storage) CopyS3Objects(ctx context.Context, parsedSrcS3Uri, parsedDestS3Uri *uri.S3Uri) error {
+	println("111111")
+	if parsedSrcS3Uri.GetBucket() == "" {
+		return fmt.Errorf("source bucket name is required in s3uri")
+	}
+
+	if parsedSrcS3Uri.GetKey() == "" {
+		return fmt.Errorf("source object key is required in s3uri")
+	}
+
+	if parsedDestS3Uri.GetBucket() == "" {
+		return fmt.Errorf("destination bucket name is required in s3uri")
+	}
+
+	return s.remote.CopyToBucket(ctx, parsedSrcS3Uri.GetBucket(), parsedDestS3Uri.GetBucket(), parsedSrcS3Uri.GetKey())
+
+	// destS3Key := parsedDestS3Uri.GetKey()
+
+	// if destS3Key == "" {
+	// 	//create dest key based on bucket root path
+
+	// }
+
+	// if strings.HasSuffix(destS3Key, "/") {
+	// 	// dest is a "directory", append the source file name
+	// }
+
+	// if !strings.HasSuffix(parsedSrcS3Uri.GetKey(), "/") {
+	// 	// create dest key based on dest s3uri file name
+	// 	return s.remote.CopyToBucket(ctx, parsedSrcS3Uri.GetBucket(), parsedDestS3Uri.GetBucket(), parsedSrcS3Uri.GetKey()+"_copy")
+	// }
+
+	// return nil
 }

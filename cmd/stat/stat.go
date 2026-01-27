@@ -21,7 +21,7 @@ func NewStatCmd() *cobra.Command {
 		Run: func(cmd *cobra.Command, args []string) {
 			o.S3Uri = args[0]
 
-			if err := o.complete(); err != nil {
+			if err := o.complete(cmd, args); err != nil {
 				fmt.Fprintf(os.Stderr, "err: %v\n", err)
 				return
 			}
@@ -46,8 +46,9 @@ type Args struct {
 	S3Uri string `validate:"omitempty"`
 }
 type Flags struct {
-	UsePathStyle bool `json:"UsePathStyle" yaml:"UsePathStyle"`
-	DryRun       bool `json:"DryRun" yaml:"DryRun"`
+	UsePathStyle bool
+	Profile      string
+	DryRun       bool
 }
 
 type Options struct {
@@ -59,8 +60,13 @@ func newOptions() *Options {
 	return &Options{}
 }
 
-func (o *Options) complete() error {
-	// 使用 viper 获取到最终生效的配置 flag > env > config > default
+func (o *Options) complete(cmd *cobra.Command, args []string) error {
+	o.Args.S3Uri = args[0]
+	if cmd.Parent() != nil {
+		o.Flags.DryRun, _ = cmd.Parent().Flags().GetBool("dryRun")
+		o.Flags.Profile, _ = cmd.Parent().Flags().GetString("profile")
+		o.Flags.UsePathStyle, _ = cmd.Parent().Flags().GetBool("path-style")
+	}
 	return nil
 }
 
@@ -77,9 +83,15 @@ func (o *Options) run() error {
 	fmt.Fprintf(os.Stdout, "options: %s\n", string(j))
 	// return nil
 
-	cli, err := s3store.NewS3Client(context.TODO(), s3store.S3Option{
+	opt := s3store.S3Option{
 		UsePathStyle: o.UsePathStyle,
-	})
+		// Region:       o.Region,
+		Profile: o.Profile,
+		// Endpoint:     o.EndpointUrl,
+		// NoVerifySSL: o.NoVerifySSL,
+		// DryRun:      o.DryRun,
+	}
+	cli, err := s3store.NewS3Client(context.TODO(), opt)
 
 	if err != nil {
 		return err

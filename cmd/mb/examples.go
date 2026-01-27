@@ -7,7 +7,7 @@ const mb_examples = `
       makes the bucket amzn-s3-demo-bucket.  The bucket is created in the re-
       gion specified in the user's configuration file:
 
-         aws s3 mb s3://amzn-s3-demo-bucket
+         s6cmd mb s3://amzn-s3-demo-bucket
 
       Output:
 
@@ -19,7 +19,7 @@ const mb_examples = `
       --region parameter.   In  this  example,  the  user  makes  the  bucket
       amzn-s3-demo-bucket in the region us-west-1:
 
-         aws s3 mb s3://amzn-s3-demo-bucket \
+         s6cmd mb s3://amzn-s3-demo-bucket \
             --region us-west-1
 
       Output:

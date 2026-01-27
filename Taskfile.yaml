@@ -1,0 +1,73 @@
+# https://taskfile.dev
+
+version: "3"
+silent: true
+
+tasks:
+  default:
+    cmds:
+      - ./s6cmd -h
+    interactive: true
+    desc: Run
+    deps:
+      - build
+
+  build: 
+    cmds:
+      - go build .
+    desc: Build binary
+
+  lint:
+    desc: Run base linters
+    cmds:
+      - golangci-lint run --path-mode=abs --config=".golangci.yml" --timeout=5m
+    env:
+      GOEXPERIMENT: null
+
+  lint-fix:
+    desc: Run base linters and fix issues
+    cmds:
+      - golangci-lint run --path-mode=abs --config=".golangci.yml" --timeout=5m --fix
+    env:
+      GOEXPERIMENT: null
+
+  test:
+    cmds:
+      - go test -v ./...
+    desc: Run tests
+
+  fmt:
+    desc: Run gofumpt
+    cmds:
+      - gofumpt -w $(git ls-files '*.go')
+
+  check-nerd-font:
+    cmds:
+      - nerdfix check $(fd --extension go)
+    desc: Find broken nerdfont characters
+
+  fix-nerd-font:
+    cmds:
+      - nerdfix fix --format=json $(fd --extension go)
+    desc: Fix broken nerdfont icons
+
+  docs-prepare:
+    cmds:
+      - cd docs && pnpm i
+
+  docs-dev:
+    cmds:
+      - cd docs && pnpm dev
+    desc: Start docs server
+
+  docs-build:
+    cmds:
+      - task: docs-prepare
+      - cd docs && pnpm build
+    desc: Run docs production build
+
+  docs-preview:
+    cmds:
+      - task: docs-build
+      - cd docs && pnpm preview
+    desc: Preview docs production build
