@@ -7,8 +7,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// Default values for SharedFlags. They mirror s5cmd's cp/sync defaults so
-// the out-of-the-box behaviour matches user expectations.
+// Default values for SharedFlags, matching the conventional cp/sync
+// defaults so the out-of-the-box behaviour matches user expectations.
 const (
 	DefaultCopyConcurrency = 5
 	DefaultPartSizeMiB     = 50
@@ -25,9 +25,9 @@ const (
 // which the user supplies in MiB but storage.Get/Put expects in bytes.
 const megabyte = 1024 * 1024
 
-// SharedFlags is the set of flags shared by cp, mv and sync. It mirrors
-// s5cmd's NewSharedFlags but is expressed as a plain struct so cobra
-// commands can register it via AddToCmd.
+// SharedFlags is the set of flags shared by cp, mv and sync. It is
+// expressed as a plain struct so cobra commands can register it via
+// AddToCmd.
 //
 // All fields are populated by cobra when the corresponding flags are parsed;
 // callers should treat the struct as read-only after AddToCmd returns.
@@ -74,8 +74,8 @@ type SharedFlags struct {
 }
 
 // NewSharedFlags returns a SharedFlags populated with the default values
-// that match s5cmd's cp/sync defaults. cobra will overwrite the fields when
-// the user passes explicit flags.
+// for cp/sync. cobra will overwrite the fields when the user passes
+// explicit flags.
 func NewSharedFlags() *SharedFlags {
 	return &SharedFlags{
 		Concurrency: DefaultCopyConcurrency,

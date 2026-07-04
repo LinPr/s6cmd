@@ -17,8 +17,7 @@ func init() {
 }
 
 // guessContentTypeReal returns the content type for file based first on
-// its extension and, failing that, on a sniff of the first 512 bytes. It
-// mirrors s5cmd's guessContentType.
+// its extension and, failing that, on a sniff of the first 512 bytes.
 func guessContentTypeReal(file *os.File) string {
 	if file == nil {
 		return ""

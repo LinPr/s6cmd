@@ -30,10 +30,10 @@ func TestE2E_SyncLocalToS3_NewFile(t *testing.T) {
 	writeFile(t, filepath.Join(srcDir, "a.txt"), "a-content")
 	writeFile(t, filepath.Join(srcDir, "b.txt"), "b-content")
 
-	// s6cmd sync mirrors s5cmd: when the source is a directory, the
-	// destination prefix is treated as the parent and the source's base
-	// name becomes the first path segment. So syncing <srcDir> to
-	// s3://bucket/ produces keys src/a.txt, src/b.txt.
+	// s6cmd sync: when the source is a directory, the destination prefix
+	// is treated as the parent and the source's base name becomes the
+	// first path segment. So syncing <srcDir> to s3://bucket/ produces
+	// keys src/a.txt, src/b.txt.
 	res := runS6cmd(t, workdir, endpoint, "sync", srcDir, "s3://"+bucket+"/")
 	if res.ExitCode != 0 {
 		t.Fatalf("s6cmd sync failed: %s\nstderr: %s", res.Stdout, res.Stderr)

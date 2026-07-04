@@ -1,6 +1,6 @@
-// Package cp implements the `s6cmd cp` command. It mirrors s5cmd's cp
-// command structure (SharedFlags + shouldOverride + prepareDownloadTask/
-// prepareUploadTask/prepareCopyTask + countingReaderWriter) but uses cobra
+// Package cp implements the `s6cmd cp` command. The cp command structure
+// is SharedFlags + shouldOverride + prepareDownloadTask/
+// prepareUploadTask/prepareCopyTask + countingReaderWriter, and uses cobra
 // + aws-sdk-go-v2 + the s6cmd parallel.Manager/Waiter framework.
 //
 // The command dispatches each source object to one of three do* functions
@@ -178,9 +178,9 @@ func (o *Options) run(ctx context.Context) error {
 
 	// Build a list of source objects first so the waiter goroutine can
 	// start draining before the first parallel.Run. The list is bounded by
-	// the size of the source, which is acceptable for the same reason s5cmd
-	// accepts it: a single cp invocation is not expected to enumerate
-	// millions of objects (that is what sync is for).
+	// the size of the source, which is acceptable for the same reason a
+	// single cp invocation is not expected to enumerate millions of
+	// objects (that is what sync is for).
 	objects, err := expandSource(ctx, store, srcURL, !o.Shared.NoFollowSymlinks, o.Recursive)
 	if err != nil {
 		return err
@@ -348,7 +348,7 @@ func (o *Options) prepareUploadTask(ctx context.Context, store *storage.Storage,
 }
 
 // doCopy performs a server-side CopyObject. Metadata is assembled from the
-// shared flags and the metadata-directive default is set per s5cmd's rule:
+// shared flags and the metadata-directive default follows the rule:
 // COPY for local->local (irrelevant here), REPLACE for S3->S3 when the
 // user did not pass a directive explicitly.
 func (o *Options) doCopy(ctx context.Context, store *storage.Storage, srcURL, dstURL *storage.StorageURL) error {
@@ -462,10 +462,10 @@ func (o *Options) doUpload(ctx context.Context, store *storage.Storage, srcURL, 
 	return nil
 }
 
-// shouldOverride mirrors s5cmd's shouldOverride. It returns nil when the
-// destination should be overwritten, and an errorpkg.ErrObject* sentinel
-// (which is a warning, not a failure) when it should not. The flags
-// --no-clobber / --if-size-differ / --if-source-newer gate the behaviour.
+// shouldOverride returns nil when the destination should be overwritten,
+// and an errorpkg.ErrObject* sentinel (which is a warning, not a failure)
+// when it should not. The flags --no-clobber / --if-size-differ /
+// --if-source-newer gate the behaviour.
 //
 // The sentinel errors are recognized by errorpkg.IsWarning so the task
 // function can short-circuit without surfacing as a command failure.
@@ -531,9 +531,9 @@ func (o *Options) sharedMetadata() storage.Metadata {
 	}
 }
 
-// prepareRemoteDestination mirrors s5cmd's prepareRemoteDestination: when
-// the dst is a prefix/bucket, the source object's base (or, for batch
-// sources without --flatten, the relative path) is appended.
+// prepareRemoteDestination resolves the destination URL for a remote
+// target: when the dst is a prefix/bucket, the source object's base (or,
+// for batch sources without --flatten, the relative path) is appended.
 func prepareRemoteDestination(srcURL, dstURL *storage.StorageURL, flatten, isBatch bool) *storage.StorageURL {
 	objname := srcURL.Base()
 	if isBatch && !flatten {
@@ -545,9 +545,9 @@ func prepareRemoteDestination(srcURL, dstURL *storage.StorageURL, flatten, isBat
 	return dstURL.Clone()
 }
 
-// prepareLocalDestination mirrors s5cmd's prepareLocalDestination: for
-// batch sources the dst is a directory; otherwise a single-file dst may be
-// renamed to the source's base name when it points at a directory.
+// prepareLocalDestination resolves the destination URL for a local target:
+// for batch sources the dst is a directory; otherwise a single-file dst
+// may be renamed to the source's base name when it points at a directory.
 func prepareLocalDestination(ctx context.Context, store *storage.Storage, srcURL, dstURL *storage.StorageURL, flatten, isBatch bool) (*storage.StorageURL, error) {
 	objname := srcURL.Base()
 	if isBatch && !flatten {

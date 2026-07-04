@@ -12,7 +12,7 @@ import "github.com/LinPr/s6cmd/internal/parallel/fdlimit"
 
 const (
 	// defaultWorkerCount is used when Init is invoked with a non-positive
-	// worker count, matching s5cmd's historical default.
+	// worker count.
 	defaultWorkerCount = 256
 )
 

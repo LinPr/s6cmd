@@ -22,8 +22,7 @@ import (
 //
 // The interface is named Store (not Storage) because the aggregate
 // dispatcher struct is already named Storage in this package; Go does not
-// allow an interface and a struct to share a name. The s5cmd reference
-// names the interface Storage because it has no aggregate struct.
+// allow an interface and a struct to share a name.
 type Store interface {
 	// Stat returns the Object structure describing object. If src is not
 	// found, ErrGivenObjectNotFound is returned.
@@ -77,11 +76,11 @@ type S3Extension interface {
 }
 
 // SelectQuery is the parameter bundle passed to S3Extension.Select. It
-// mirrors s5cmd's storage.SelectQuery so the call site (cmd/select) can
-// build it without having to import the s3 SDK types directly. The
-// InputSerialization/OutputSerialization pointers are constructed by the
-// s3store from the format/compression/header fields, which keeps the
-// aws-sdk-go-v2 types out of the storage package's public surface.
+// lets the call site (cmd/select) build it without having to import the
+// s3 SDK types directly. The InputSerialization/OutputSerialization
+// pointers are constructed by the s3store from the format/compression/
+// header fields, which keeps the aws-sdk-go-v2 types out of the storage
+// package's public surface.
 type SelectQuery struct {
 	// ExpressionType is "SQL" (the only value S3 supports). It is sent
 	// verbatim to the SDK as ExpressionType.

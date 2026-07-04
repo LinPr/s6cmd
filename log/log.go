@@ -4,9 +4,9 @@
 // the channel and writes to stdout/stderr so concurrent writes never
 // interleave.
 //
-// The package mirrors s5cmd/log so callers can keep the same shape
-// (Info/Debug/Trace/Error/Stat + Message interface) but drops the dependency
-// on the url package by typing Source/Destination as strings.
+// The package exposes the same shape (Info/Debug/Trace/Error/Stat +
+// Message interface) but drops the dependency on the url package by
+// typing Source/Destination as strings.
 package log
 
 import (

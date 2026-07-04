@@ -1,6 +1,6 @@
-// Package sync implements the `s6cmd sync` command. It mirrors s5cmd's
-// sync command structure (compareObjects + planRun + SyncStrategy) but
-// uses cobra + aws-sdk-go-v2 + the s6cmd parallel.Manager framework.
+// Package sync implements the `s6cmd sync` command. The sync command
+// structure is compareObjects + planRun + SyncStrategy, and uses cobra +
+// aws-sdk-go-v2 + the s6cmd parallel.Manager framework.
 //
 // The previous implementation had a data race: the `expected` map was
 // written from inside task functions that ran on cliutil.RunTasks worker
@@ -389,11 +389,10 @@ func (o *Options) queueDelete(ctx context.Context, store *storage.Storage, waite
 	}, waiter)
 }
 
-// generateDestinationURL mirrors s5cmd's generateDestinationURL: for
-// batch sources the destination key is the source's relative path under
-// the destination prefix; for single-file sources it is the source's base
-// name joined to the destination (or the destination itself when it is a
-// full key).
+// generateDestinationURL resolves the destination URL: for batch sources
+// the destination key is the source's relative path under the destination
+// prefix; for single-file sources it is the source's base name joined
+// to the destination (or the destination itself when it is a full key).
 func generateDestinationURL(srcURL, dstURL *storage.StorageURL, isBatch bool) *storage.StorageURL {
 	objname := srcURL.Base()
 	if isBatch {
@@ -588,8 +587,7 @@ func dstForListing(dst *storage.StorageURL) *storage.StorageURL {
 // --- sync strategy ---
 
 // syncStrategy is the interface that decides whether a common source and
-// destination object should be re-copied. It mirrors s5cmd's
-// SyncStrategy.
+// destination object should be re-copied.
 type syncStrategy interface {
 	ShouldSync(src, dst *storage.Object) error
 }
@@ -613,7 +611,7 @@ func (s *sizeOnlyStrategy) ShouldSync(src, dst *storage.Object) error {
 }
 
 // sizeAndModificationStrategy copies when the source is newer or the
-// sizes differ. It mirrors s5cmd's SizeAndModificationStrategy.
+// sizes differ.
 type sizeAndModificationStrategy struct{}
 
 func (s *sizeAndModificationStrategy) ShouldSync(src, dst *storage.Object) error {

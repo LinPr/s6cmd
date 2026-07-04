@@ -1,6 +1,5 @@
 // Package bucketversion implements the `s6cmd bucket-version` command. It
-// mirrors s5cmd's bucket-version command: query or set the versioning state
-// of an S3 bucket.
+// queries or sets the versioning state of an S3 bucket.
 //
 // Without --set it calls GetBucketVersioning and prints the status; with
 // --set Suspended|Enabled it calls SetBucketVersioning. The status string
@@ -138,9 +137,10 @@ func (o *Options) run(ctx context.Context, out io.Writer) error {
 	return nil
 }
 
-// bucketVersionMessage mirrors s5cmd's BucketVersionMessage. The unexported
-// isSet field is populated by run() and read by String() so the plain-text
-// rendering can distinguish "set to" (after --set) from "is" (query).
+// bucketVersionMessage is the JSON payload for a bucket-version result.
+// The unexported isSet field is populated by run() and read by String() so
+// the plain-text rendering can distinguish "set to" (after --set) from "is"
+// (query).
 type bucketVersionMessage struct {
 	Bucket string `json:"bucket"`
 	Status string `json:"status"`

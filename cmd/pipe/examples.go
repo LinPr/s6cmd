@@ -10,7 +10,7 @@ Example 2: Attach arbitrary metadata to the streamed object
 
 Example 3: Download an object and stream it to a bucket
 
-         curl https://github.com/peak/s5cmd/ | s6cmd pipe s3://bucket/s5cmd.html
+         curl https://example.com/index.html | s6cmd pipe s3://bucket/index.html
 
 Example 4: Compress an object and stream it to a bucket
 

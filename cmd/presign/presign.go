@@ -1,5 +1,5 @@
-// Package presign implements the `s6cmd presign` command. It mirrors s5cmd's
-// presign command but uses cobra + the s6cmd storage aggregate.
+// Package presign implements the `s6cmd presign` command. It uses cobra +
+// the s6cmd storage aggregate.
 //
 // The command generates a time-limited GET URL for a single remote object
 // via storage.Presign and prints it to stdout. Buckets, prefixes and
@@ -19,8 +19,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// defaultExpire is the default validity window for presigned URLs, matching
-// s5cmd's default of three hours.
+// defaultExpire is the default validity window for presigned URLs, set to
+// three hours.
 const defaultExpire = 3 * time.Hour
 
 // NewPresignCmd creates the `presign` command.

@@ -1,6 +1,6 @@
-// Package version implements the `s6cmd version` command. It mirrors s5cmd's
-// version command: a flag-less command that prints the build-time version
-// string returned by version.GetHumanVersion().
+// Package version implements the `s6cmd version` command: a flag-less
+// command that prints the build-time version string returned by
+// version.GetHumanVersion().
 package version
 
 import (

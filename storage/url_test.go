@@ -402,11 +402,11 @@ func TestSetPrefixAndFilter(t *testing.T) {
 // a.log but not a.txt; ? matches exactly one character; * does not cross /
 // for wildcard patterns whose prefix already pins the directory.
 //
-// Note (s5cmd semantics): the filter regex produced by setPrefixAndFilter
-// uses ".*" for "*", which CAN cross "/" — so for s3://bucket/*.log a key
-// like "a/b.log" matches. The "does not cross /" guarantee applies to
-// wildcard patterns whose prefix is a directory (e.g. s3://bucket/logs/*.log
-// — there, "logs/sub/a.log" still matches because .* is greedy, but the
+// Note: the filter regex produced by setPrefixAndFilter uses ".*" for
+// "*", which CAN cross "/" — so for s3://bucket/*.log a key like
+// "a/b.log" matches. The "does not cross /" guarantee applies to wildcard
+// patterns whose prefix is a directory (e.g. s3://bucket/logs/*.log —
+// there, "logs/sub/a.log" still matches because .* is greedy, but the
 // relative-path parser parseBatch only trims back to the last "/" before
 // the filter). These cases pin down the actual behaviour of the layer
 // rather than the shell-glob intuition.
@@ -510,7 +510,7 @@ func TestStorageURLBase(t *testing.T) {
 	}{
 		{"s3://bucket/key.txt", "key.txt"},
 		{"s3://bucket/a/b/c", "c"},
-		// path.Base("") == "."; this matches s5cmd behaviour.
+		// path.Base("") == "."; this is the standard library behaviour.
 		{"s3://bucket", "."},
 		{"/local/path/file.txt", "file.txt"},
 	}
@@ -705,8 +705,7 @@ func TestStorageURLAbsolute(t *testing.T) {
 	}
 }
 
-// TestParseBatch mirrors the s5cmd test cases for the batch (wildcard)
-// relative-path parser.
+// TestParseBatch covers the batch (wildcard) relative-path parser.
 func TestParseBatch(t *testing.T) {
 	t.Parallel()
 
@@ -731,8 +730,7 @@ func TestParseBatch(t *testing.T) {
 	}
 }
 
-// TestParseNonBatch mirrors the s5cmd test cases for the non-batch
-// (prefix) relative-path parser.
+// TestParseNonBatch covers the non-batch (prefix) relative-path parser.
 func TestParseNonBatch(t *testing.T) {
 	t.Parallel()
 

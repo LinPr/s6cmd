@@ -1,5 +1,5 @@
-// Package pipe implements the `s6cmd pipe` command. It mirrors s5cmd's
-// pipe command: stream os.Stdin to a single remote object via storage.Put.
+// Package pipe implements the `s6cmd pipe` command: stream os.Stdin to a
+// single remote object via storage.Put.
 //
 // The destination must be a remote object (not a bucket/prefix/wildcard).
 // The stdin adapter exposes only io.Reader — not io.Seeker — so the AWS
@@ -70,9 +70,8 @@ type Args struct {
 	DestUri string `validate:"required"`
 }
 
-// Flags holds the pipe-specific flags. They mirror s5cmd's
-// NewPipeCommandFlags but are expressed as a plain struct so cobra can
-// register them directly.
+// Flags holds the pipe-specific flags. They are expressed as a plain
+// struct so cobra can register them directly.
 type Flags struct {
 	StorageClass       string
 	Concurrency        int
@@ -186,9 +185,9 @@ func (o *Options) run(ctx context.Context) error {
 	return nil
 }
 
-// shouldOverride mirrors s5cmd's Pipe.shouldOverride: when --no-clobber is
-// set, stat the destination and return ErrObjectExists if it already exists.
-// Without --no-clobber it is a no-op.
+// shouldOverride handles --no-clobber: when set, stat the destination and
+// return ErrObjectExists if it already exists. Without --no-clobber it is
+// a no-op.
 func (o *Options) shouldOverride(ctx context.Context, store *storage.Storage, dst *storage.StorageURL) error {
 	if !o.NoClobber {
 		return nil
@@ -209,7 +208,7 @@ func (o *Options) shouldOverride(ctx context.Context, store *storage.Storage, ds
 
 // guessContentTypeByExtension returns the content type for dst based on its
 // extension, falling back to "application/octet-stream" when the extension
-// is unknown. It mirrors s5cmd's guessContentTypeByExtension.
+// is unknown.
 func guessContentTypeByExtension(name string) string {
 	ct := mime.TypeByExtension(filepath.Ext(name))
 	if ct == "" {

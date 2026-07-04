@@ -1,5 +1,5 @@
-// Package cat implements the `s6cmd cat` command. It mirrors s5cmd's cat
-// command but uses cobra + the s6cmd storage aggregate + orderedwriter.
+// Package cat implements the `s6cmd cat` command. It uses cobra + the
+// s6cmd storage aggregate + orderedwriter.
 //
 // A single remote object is streamed to stdout via storage.Get, wrapping
 // os.Stdout in an orderedwriter so the multipart downloader's out-of-order
@@ -136,7 +136,7 @@ func (o *Options) run(ctx context.Context, out io.Writer) error {
 
 // processObjects drains the listing channel and prints each matching object
 // in turn. Directory entries (CommonPrefixes) are skipped. The first error
-// short-circuits the command, matching s5cmd's behaviour.
+// short-circuits the command.
 func (o *Options) processObjects(ctx context.Context, store *storage.Storage, src *storage.StorageURL, out io.Writer, concurrency int, partSize int64) error {
 	for obj := range store.List(ctx, src, false) {
 		if obj.Err != nil {

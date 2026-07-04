@@ -77,7 +77,7 @@ jobs:
         tag_name: ${{ steps.get_version.outputs.VERSION }}
         name: Release ${{ steps.get_version.outputs.VERSION }}
         draft: false
-        prerelease: false
+        prerelease: true   # s6cmd is pre-1.0; mark releases as prerelease
         generate_release_notes: true
         files: |
           s6cmd-linux-amd64

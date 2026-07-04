@@ -169,8 +169,8 @@ func TestIsWarning_NotWarning(t *testing.T) {
 
 // TestIsWarning_WrappedSentinel verifies that wrapping a sentinel still
 // reports true. This documents the current implementation: IsWarning uses a
-// direct == comparison (mirroring s5cmd), so wrapped sentinels are NOT
-// recognized. Callers should pass the unwrapped sentinel.
+// direct == comparison, so wrapped sentinels are NOT recognized. Callers
+// should pass the unwrapped sentinel.
 func TestIsWarning_WrappedSentinel(t *testing.T) {
 	t.Parallel()
 	wrapped := fmt.Errorf("cp: %w", errorpkg.ErrObjectExists)

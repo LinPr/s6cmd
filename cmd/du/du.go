@@ -186,8 +186,7 @@ func formatSizeLine(source, class string, sc sizeAndCount, humanize bool) string
 }
 
 // compileWildcards converts a list of shell wildcard patterns to regex
-// strings, mirroring s5cmd's createRegexFromWildcard. An empty input returns
-// nil with no error.
+// strings. An empty input returns nil with no error.
 func compileWildcards(patterns []string) ([]string, error) {
 	if len(patterns) == 0 {
 		return nil, nil

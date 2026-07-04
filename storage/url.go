@@ -123,7 +123,7 @@ func NewStorageURL(s string, opts ...Option) (*StorageURL, error) {
 	// can still pass their own WithVersion to override it. The "?" is only
 	// treated as a query separator when the query parses cleanly AND contains
 	// a versionId parameter; otherwise the "?" is kept as a glob character
-	// (matching s5cmd semantics, where "?" is a single-char wildcard).
+	// ("?" is a single-char wildcard).
 	if idx := strings.IndexByte(key, '?'); idx >= 0 {
 		rawQuery := key[idx+1:]
 		if q, err := url.ParseQuery(rawQuery); err == nil {

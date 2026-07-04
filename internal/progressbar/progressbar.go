@@ -1,5 +1,5 @@
 // Package progressbar defines the progress-reporting interface used by
-// commands. The real implementation (CommandProgressBar in s5cmd) pulls in
+// commands. The real implementation (CommandProgressBar) pulls in
 // github.com/cheggaaa/pb/v3; s6cmd does not want that dependency for this
 // pass, so New returns a NoOp regardless of visibility. The interface is
 // in place so commands can be wired against it now and a real bar can be

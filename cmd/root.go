@@ -346,7 +346,7 @@ func registerSubCommands(cmd *cobra.Command) {
 	cmd.AddCommand(rb.NewRbCmd())
 	cmd.AddCommand(tree.NewTreeCmd())
 
-	// New commands mirroring s5cmd's cat/presign/head/version/
+	// Additional commands: cat/presign/head/version/
 	// bucket-version/pipe, adapted to cobra + the s6cmd storage
 	// aggregate.
 	cmd.AddCommand(cat.NewCatCmd())
@@ -356,9 +356,8 @@ func registerSubCommands(cmd *cobra.Command) {
 	cmd.AddCommand(bucketversion.NewBucketVersionCmd())
 	cmd.AddCommand(pipe.NewPipeCmd())
 
-	// select mirrors s5cmd's select command (csv/json/parquet
-	// subcommands + JSON-Lines fallback) backed by the v2
-	// SelectObjectContent EventStream.
+	// select provides csv/json/parquet subcommands + a JSON-Lines
+	// fallback, backed by the v2 SelectObjectContent EventStream.
 	cmd.AddCommand(selectCmd.NewSelectCmd())
 
 	// run reads commands from a file (or stdin) and dispatches each line

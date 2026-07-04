@@ -142,12 +142,12 @@ type S3Store struct {
 // retry id. On a NoSuchUpload error the store Stats the target and compares
 // the value of this metadata to the id sent with the upload: a match means
 // a previous attempt actually succeeded despite the error, so Put returns
-// nil instead of retrying. Mirrors s5cmd's s5cmd-upload-retry-id.
+// nil instead of retrying.
 const metadataKeyRetryID = "s6cmd-upload-retry-id"
 
 // newRetryer builds the SDK v2 retryer. It starts from retry.NewStandard
 // (which already covers throttling, 5xx, RequestTimeout, connection errors,
-// etc.) and layers on the s5cmd-style extra retryable error codes
+// etc.) and layers on extra retryable error codes
 // (InternalError, RequestTimeTooSkewed, SlowDown) plus a deny-list for the
 // token errors (ExpiredToken, ExpiredTokenException, InvalidToken) which
 // must NOT be retried even if the standard rules would allow it.
@@ -159,9 +159,9 @@ func newRetryer(max int) aws.Retryer {
 		if max > 0 {
 			o.MaxAttempts = max
 		}
-		// Append the s5cmd-style extra retryable codes. StandardOptions
-		// already seeds Retryables with DefaultRetryables, so we append
-		// rather than replace.
+		// Append the extra retryable codes. StandardOptions already
+		// seeds Retryables with DefaultRetryables, so we append rather
+		// than replace.
 		o.Retryables = append(o.Retryables, retry.IsErrorRetryableFunc(func(err error) aws.Ternary {
 			if err == nil {
 				return aws.UnknownTernary
@@ -180,7 +180,7 @@ func newRetryer(max int) aws.Retryer {
 			// error codes; they appear inside the error message. The v2
 			// standard retryer already handles "connection reset" via
 			// RetryableConnectionError, so we only add the timed-out
-			// variant here for parity with s5cmd.
+			// variant here.
 			if strings.Contains(apiErr.ErrorMessage(), "connection timed out") {
 				return aws.TrueTernary
 			}

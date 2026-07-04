@@ -65,8 +65,8 @@ type S3Option struct {
 	// MaxRetries is the maximum number of attempts the SDK retryer will
 	// make for a retriable request. A non-positive value leaves the SDK
 	// default (3) in place. The retryer is the v2 standard retryer
-	// (retry.NewStandard) extended with the s5cmd-style extra retryable
-	// error codes (InternalError, RequestTimeTooSkewed, SlowDown, plus
+	// (retry.NewStandard) extended with extra retryable error codes
+	// (InternalError, RequestTimeTooSkewed, SlowDown, plus
 	// connection-reset/connection-timed-out string matches) and with the
 	// token errors (ExpiredToken/ExpiredTokenException/InvalidToken)
 	// explicitly excluded.
@@ -75,9 +75,9 @@ type S3Option struct {
 	MaxRetries int
 
 	// NoSuchUploadRetryCount enables retry-on-NoSuchUpload with the given
-	// number of attempts. Mirrors s5cmd's behaviour: when the multipart
-	// uploader returns NoSuchUpload, the store Stats the target and compares
-	// the `s6cmd-upload-retry-id` metadata against the value that was sent
+	// number of attempts. When the multipart uploader returns
+	// NoSuchUpload, the store Stats the target and compares the
+	// `s6cmd-upload-retry-id` metadata against the value that was sent
 	// with the upload; a match means a previous attempt actually succeeded
 	// (despite the error) and is treated as success, otherwise the upload is
 	// retried up to NoSuchUploadRetryCount times. A non-positive value

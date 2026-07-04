@@ -18,8 +18,8 @@ import (
 // reads) and manager.Downloader (which WriteAts).
 //
 // The ReadAt path tracks offsets that have already been accounted for via
-// the SDK's signature-fetch; this mirrors s5cmd's countingReaderWriter so
-// the progress bar does not double-count signature reads.
+// the SDK's signature-fetch; this keeps the progress bar from
+// double-counting signature reads.
 type countingReaderWriter struct {
 	pb      progressbar.ProgressBar
 	fp      *os.File
@@ -56,7 +56,7 @@ func (r *countingReaderWriter) Read(p []byte) (int, error) {
 
 // ReadAt reads from the underlying file at off. The first ReadAt at any
 // offset is treated as a signature read by the SDK and not counted; this
-// matches s5cmd's behaviour so the progress bar does not double-count.
+// keeps the progress bar from double-counting.
 func (r *countingReaderWriter) ReadAt(p []byte, off int64) (int, error) {
 	n, err := r.fp.ReadAt(p, off)
 	r.mu.Lock()
@@ -83,9 +83,9 @@ func (r *countingReaderWriter) Close() error {
 }
 
 // GuessContentType returns the content type for the file based first on its
-// extension and, failing that, on a sniff of the first 512 bytes. It mirrors
-// s5cmd's guessContentType so cp/mv/sync can populate the metadata on
-// uploads without duplicating the logic.
+// extension and, failing that, on a sniff of the first 512 bytes. It lets
+// cp/mv/sync populate the metadata on uploads without duplicating the
+// logic.
 func GuessContentType(file *os.File) string {
 	if file == nil {
 		return ""
@@ -198,9 +198,9 @@ func wildcardMatchIterative(pattern, s string) bool {
 }
 
 // IsObjectExcluded reports whether name should be excluded given the
-// exclude/include pattern sets. The semantics match s5cmd: an object is
-// excluded when it matches any exclude pattern; if include patterns are
-// present, only matching objects are included (so a non-match excludes).
+// exclude/include pattern sets. An object is excluded when it matches any
+// exclude pattern; if include patterns are present, only matching objects
+// are included (so a non-match excludes).
 //
 // The empty-pattern cases are handled explicitly so callers can pass nil
 // slices without filtering everything out.

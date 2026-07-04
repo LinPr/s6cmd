@@ -1,6 +1,6 @@
 // Package orderedwriter_test contains tests for the OrderedWriterAt. The
-// cases mirror the s5cmd orderedwriter_test.go structure but are written
-// without the gotest.tools dependency so they can run on a bare stdlib.
+// cases are written without the gotest.tools dependency so they can run on
+// a bare stdlib.
 package orderedwriter_test
 
 import (
@@ -249,11 +249,10 @@ func TestOutrunningChunk(t *testing.T) {
 	}
 }
 
-// TestBufferWithChangingSlice mirrors the s5cmd test of the same name: a
-// worker pool writes chunks whose backing slice is reused (we simulate this
-// by mutating the slice before the writer is forced to flush). The
-// OrderedWriterAt must copy on buffer, so the final output should still
-// equal the expected stream.
+// TestBufferWithChangingSlice verifies that a worker pool can write chunks
+// whose backing slice is reused (we simulate this by mutating the slice
+// before the writer is forced to flush). The OrderedWriterAt must copy on
+// buffer, so the final output should still equal the expected stream.
 func TestBufferWithChangingSlice(t *testing.T) {
 	t.Parallel()
 

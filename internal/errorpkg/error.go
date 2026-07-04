@@ -1,10 +1,10 @@
 // Package errorpkg provides error types and helpers used across s6cmd.
 //
-// The Error struct mirrors s5cmd's error.Error but uses plain strings for
-// Src/Dst so it can be reused before the storage/url abstraction is fully
-// wired up. IsCancelation recognizes context.Canceled and smithy's
-// CanceledError (the two forms aws-sdk-go-v2 surfaces when a request is
-// canceled) without depending on the storage layer.
+// The Error struct uses plain strings for Src/Dst so it can be reused
+// before the storage/url abstraction is fully wired up. IsCancelation
+// recognizes context.Canceled and smithy's CanceledError (the two forms
+// aws-sdk-go-v2 surfaces when a request is canceled) without depending on
+// the storage layer.
 package errorpkg
 
 import (

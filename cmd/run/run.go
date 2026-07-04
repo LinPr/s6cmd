@@ -1,7 +1,6 @@
-// Package run implements the `s6cmd run` command. It mirrors s5cmd's run
-// command (read commands from a file or stdin, dispatch each line as a
-// separate s6cmd invocation in parallel) but adapts it to the cobra + s6cmd
-// toolchain.
+// Package run implements the `s6cmd run` command. The run command reads
+// commands from a file or stdin, dispatches each line as a separate s6cmd
+// invocation in parallel, and adapts it to the cobra + s6cmd toolchain.
 //
 // Execution model: each non-comment, non-empty line is forked as a child
 // s6cmd process via os/exec. The alternative — reusing the in-process
@@ -166,7 +165,7 @@ func (o *Options) validate() error {
 }
 
 // run reads commands line-by-line and dispatches each as a child s6cmd
-// process. It mirrors s5cmd's Run.Run:
+// process. The flow is:
 //
 //   - parallel.New(numWorkers) builds a dedicated worker pool (NOT the
 //     global Manager, because run-level parallelism is per-line, not
@@ -343,10 +342,10 @@ func globalFlagArgs(cf cliutil.CommonFlags) []string {
 	return args
 }
 
-// lineReader is a cancelable line reader. It mirrors s5cmd's Reader: a
-// goroutine reads lines from the underlying reader and pushes them onto
-// a channel; the read loop exits when ctx is cancelled or the underlying
-// reader returns an error (EOF is not surfaced as an error).
+// lineReader is a cancelable line reader. A goroutine reads lines from
+// the underlying reader and pushes them onto a channel; the read loop
+// exits when ctx is cancelled or the underlying reader returns an error
+// (EOF is not surfaced as an error).
 type lineReader struct {
 	reader *bufio.Reader
 	err    error

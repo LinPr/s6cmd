@@ -1,6 +1,6 @@
-// Package rm implements the `s6cmd rm` command. It mirrors s5cmd's rm
-// command structure (expandSources -> MultiDelete + parallel.Waiter) but
-// uses cobra + aws-sdk-go-v2 + the s6cmd parallel.Manager framework.
+// Package rm implements the `s6cmd rm` command. The rm command structure
+// is expandSources -> MultiDelete + parallel.Waiter, and uses cobra +
+// aws-sdk-go-v2 + the s6cmd parallel.Manager framework.
 //
 // The command supports:
 //   - --exclude / --include wildcard patterns (repeatable)
@@ -151,8 +151,7 @@ func (o *Options) run(ctx context.Context) error {
 
 	// Collect source objects into a slice first so we can drive the
 	// MultiDelete channel from a single producer goroutine. The slice is
-	// bounded by the number of objects under the prefix, which is the
-	// same bound s5cmd accepts.
+	// bounded by the number of objects under the prefix.
 	objects, err := expandRmSources(ctx, store, url)
 	if err != nil {
 		return err

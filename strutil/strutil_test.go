@@ -91,7 +91,7 @@ func Test_WildCardToRegexp(t *testing.T) {
 //
 // Note: the implementation uses ">" (strict) when picking the unit, so a
 // value exactly equal to a unit boundary (1024, 1<<20, ...) stays in the
-// smaller unit. This mirrors s5cmd's HumanizeBytes behaviour.
+// smaller unit.
 func TestHumanizeBytes(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

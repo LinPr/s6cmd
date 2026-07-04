@@ -1,7 +1,7 @@
-// Package selectcmd implements the `s6cmd select` command. It mirrors
-// s5cmd's select command structure (csv/json/parquet subcommands + a
-// default fallback that treats the source as JSON-Lines) but uses cobra +
-// aws-sdk-go-v2 + the s6cmd parallel.Manager framework.
+// Package selectcmd implements the `s6cmd select` command. The select
+// command structure is csv/json/parquet subcommands + a default fallback
+// that treats the source as JSON-Lines, and uses cobra + aws-sdk-go-v2 +
+// the s6cmd parallel.Manager framework.
 //
 // The command expands the source URL (wildcard/prefix/single object) into
 // an object channel via storage.List, then for each object schedules a
@@ -44,7 +44,7 @@ func NewSelectCmd() *cobra.Command {
 		Args:    cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Default fallback: no subcommand given. Treat the source as
-			// JSON-Lines, matching s5cmd's behaviour.
+			// JSON-Lines.
 			o.inputFormat = "json"
 			o.inputStructure = "lines"
 			if err := o.complete(cmd, args); err != nil {
@@ -148,7 +148,7 @@ func newSelectParquetCmd(root *Options) *cobra.Command {
 }
 
 // addSharedSelectFlags registers the flags common to the top-level select
-// command and all its subcommands. They mirror s5cmd's sharedFlags slice.
+// command and all its subcommands.
 func addSharedSelectFlags(cmd *cobra.Command, o *Options) {
 	cmd.Flags().StringVarP(&o.Query, "query", "e", "", "SQL expression to use to select from the objects")
 	cmd.Flags().StringVar(&o.OutputFormat, "output-format", "", "output format of the result (json, csv)")
@@ -280,7 +280,7 @@ func (o *Options) validate() error {
 }
 
 // run is the shared entry point for the top-level select command and all
-// its subcommands. It mirrors s5cmd's Select.Run:
+// its subcommands. The flow is:
 //
 //  1. expandSource -> objch (channel of *storage.Object)
 //  2. parallel.NewWaiter + resultCh := make(chan json.RawMessage, 128)

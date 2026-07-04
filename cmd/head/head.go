@@ -1,7 +1,7 @@
 // Package head implements the `s6cmd head` command. It is the JSON-leaning
 // counterpart to `stat`: where stat prints multi-line human-readable output,
 // head emits a single JSON object per result so it is easy to consume from
-// scripts. The behaviour mirrors s5cmd's head command.
+// scripts.
 //
 // For a bucket target it HeadBuckets and prints the bucket URL; for an
 // object target it HeadObjects and prints the object metadata as JSON.
@@ -173,8 +173,6 @@ func mdUserDefined(md *storage.Metadata) map[string]string {
 }
 
 // headObjectMessage is the JSON payload for a single object HeadObject result.
-// It mirrors s5cmd's HeadObjectMessage so consumers can parse either tool's
-// output with the same schema.
 type headObjectMessage struct {
 	Key                  string            `json:"key,omitempty"`
 	ContentType          string            `json:"content_type,omitempty"`

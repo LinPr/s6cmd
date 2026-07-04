@@ -1,6 +1,6 @@
-// Package mv implements the `s6cmd mv` command. It mirrors s5cmd's mv
-// command structure (cp + delete-source) but uses cobra + aws-sdk-go-v2 +
-// the s6cmd parallel.Manager/Waiter framework.
+// Package mv implements the `s6cmd mv` command. The mv command structure
+// is cp + delete-source, and uses cobra + aws-sdk-go-v2 + the s6cmd
+// parallel.Manager/Waiter framework.
 //
 // mv is structurally cp+delete: each source object is copied to the
 // destination via the same SharedFlags-driven path (so --concurrency /
@@ -254,7 +254,7 @@ func moveS3ToS3(ctx context.Context, store *storage.Storage, src, dest *storage.
 
 	// Copy phase on the parallel.Manager. The delete-source phase only
 	// runs when the copy phase had no errors, so a partial failure leaves
-	// the source intact (mirrors s5cmd's mv semantics).
+	// the source intact.
 	if err := runParallel(func(waiter *parallel.Waiter) error {
 		for _, op := range ops {
 			op := op

@@ -541,12 +541,12 @@ func (s *S3Store) Put(ctx context.Context, reader io.Reader, to *storage.Storage
 	return err
 }
 
-// retryOnNoSuchUpload mirrors s5cmd's retryOnNoSuchUpload. When the
-// uploader returns NoSuchUpload, the target object is Statted; if its
-// s6cmd-upload-retry-id metadata matches the value sent with the upload,
-// the upload is treated as successful (a previous attempt completed
-// despite the error). Otherwise the upload is retried up to
-// noSuchUploadRetryCount times.
+// retryOnNoSuchUpload handles NoSuchUpload by checking whether a previous
+// attempt actually succeeded. When the uploader returns NoSuchUpload, the
+// target object is Statted; if its s6cmd-upload-retry-id metadata matches
+// the value sent with the upload, the upload is treated as successful (a
+// previous attempt completed despite the error). Otherwise the upload is
+// retried up to noSuchUploadRetryCount times.
 //
 // The retry id is read from input.Metadata, which the caller populated
 // before the first attempt. The same id is reused for every retry so a
@@ -705,8 +705,8 @@ func (s *S3Store) Select(ctx context.Context, url *storage.StorageURL, query *st
 
 	// S3 Select may split a single logical record across multiple Records
 	// events, so we accumulate payload bytes and split on newlines. This
-	// matches s5cmd's "one json.RawMessage per line" contract regardless of
-	// whether the underlying output is JSON-lines or CSV.
+	// yields one json.RawMessage per line regardless of whether the
+	// underlying output is JSON-lines or CSV.
 	var buf []byte
 	for event := range stream.Events() {
 		// Respect ctx cancellation: if the consumer (e.g. stdout pipe
@@ -765,9 +765,9 @@ func (s *S3Store) Select(ctx context.Context, url *storage.StorageURL, query *st
 }
 
 // buildInputSerialization constructs the v2 InputSerialization for the
-// given SelectQuery. The mapping mirrors s5cmd's parseInputSerialization:
-// json → JSONInput{Type}, csv → CSVInput{FieldDelimiter, FileHeaderInfo},
-// parquet → ParquetInput{}. Compression is applied only for json and csv.
+// given SelectQuery. The mapping is: json → JSONInput{Type}, csv →
+// CSVInput{FieldDelimiter, FileHeaderInfo}, parquet → ParquetInput{}.
+// Compression is applied only for json and csv.
 func buildInputSerialization(q *storage.SelectQuery) (*types.InputSerialization, error) {
 	s := &types.InputSerialization{}
 	switch q.InputFormat {
@@ -812,8 +812,8 @@ func buildInputSerialization(q *storage.SelectQuery) (*types.InputSerialization,
 }
 
 // buildOutputSerialization constructs the v2 OutputSerialization. When the
-// user did not specify an output format, it defaults to the input format
-// (matching s5cmd). CSV output reuses the input's delimiter when set.
+// user did not specify an output format, it defaults to the input format.
+// CSV output reuses the input's delimiter when set.
 func buildOutputSerialization(q *storage.SelectQuery) (*types.OutputSerialization, error) {
 	format := q.OutputFormat
 	if format == "" {

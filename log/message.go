@@ -22,7 +22,7 @@ type InfoMessage struct {
 	Object      Message `json:"object,omitempty"`
 
 	// VersionID is exported only so JSON marshalling includes it; it is
-	// populated from Source when Destination is empty (mirroring s5cmd).
+	// populated from Source when Destination is empty.
 	VersionID string `json:"version_id,omitempty"`
 }
 
