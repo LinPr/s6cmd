@@ -34,3 +34,9 @@ go.work.sum
 s6cmd
 Makefile
 vendor/
+
+# goreleaser / build output
+dist/
+
+.codex/
+.claude/

@@ -25,6 +25,14 @@ s6cmd currently supports the following S3 operations:
   - `rm` - Remove objects from S3
   - `stat` - Display object metadata
   - `du` - Display disk usage for objects
+  - `cat` - Print object contents to stdout
+  - `head` - Show object head metadata
+  - `presign` - Generate a pre-signed URL for an object
+  - `pipe` - Stream stdin to a remote object
+  - `sync` - Synchronize local/remote directories
+  - `tree` - Display bucket/prefix structure as a tree
+  - `version` - Print the s6cmd version
+  - `bucket-version` - Show bucket versioning configuration
 
 
 
@@ -51,7 +59,13 @@ sudo mv s6cmd-darwin-arm64 /usr/local/bin/s6cmd
 ```bash
 git clone https://github.com/LinPr/s6cmd.git
 cd s6cmd
+
+# Plain build (version prints as "dev")
 go build -o s6cmd .
+
+# Stamped build (recommended) — injects the version string printed by `s6cmd version`
+VERSION=$(git describe --tags --always)
+go build -ldflags "-X github.com/LinPr/s6cmd/version.Version=${VERSION}" -o s6cmd .
 ```
 
 ## Configuration
@@ -60,7 +74,7 @@ s6cmd uses AWS credentials and configuration, similar to the AWS CLI. You can co
 
 ### Environment Variables
 ```bash
-export export AWS_ENDPOINT_URL_S3=your-object-storage-service-endpoint
+export AWS_ENDPOINT_URL_S3=your-object-storage-service-endpoint
 export AWS_ACCESS_KEY_ID=your-access-key
 export AWS_SECRET_ACCESS_KEY=your-secret-key
 export AWS_REGION=your-object-storage-region
@@ -72,9 +86,69 @@ aws configure
 ```
 
 ### Configuration File
-Create a configuration file at `config/s6cmd.yaml`:
 
+s6cmd reads a YAML configuration file for default flag values. The file is
+searched (in order) at:
 
+- the path passed via `--config /path/to/s6cmd.yaml`
+- the path in the `S6CMD_CONFIG` environment variable
+- `~/.s6cmd.yaml`
+- `./config/s6cmd.yaml`
+- `./s6cmd.yaml`
+
+Keys mirror the long flag names. A starter template lives at
+[`config/s6cmd.yaml`](config/s6cmd.yaml):
+
+```yaml
+endpoint-url: ""
+region: ""
+profile: ""
+no-verify-ssl: false
+no-paginate: false
+output: text
+path-style: false
+addressing-style: ""  # path | virtual | auto
+```
+
+### Configuration Precedence
+
+For every shared flag s6cmd resolves settings in this order, highest priority
+first:
+
+1. **command-line flag** (e.g. `--region us-east-1`)
+2. **environment variable** (`AWS_REGION`, `AWS_PROFILE`, `AWS_ENDPOINT_URL_S3`,
+   `AWS_NO_VERIFY_SSL`, `AWS_NO_PAGINATE`, `AWS_OUTPUT`, `S6CMD_USE_PATH_STYLE`,
+   `S3_ADDRESSING_STYLE`, `S6CMD_CONFIG`)
+3. **config file** value
+4. cobra flag default
+
+This mirrors the AWS CLI's behaviour: explicit flags win, env comes next,
+config file after that, and the built-in default is the last resort.
+
+### Addressing Style
+
+S3 supports two URL styles for addressing buckets. s6cmd lets you pick via
+`--addressing-style` (env `S3_ADDRESSING_STYLE`):
+
+| Style    | URL shape                            | When to use                              |
+|----------|--------------------------------------|------------------------------------------|
+| `path`   | `https://endpoint/bucket/key`        | MinIO, Alibaba OSS, Tencent COS, GCS XML |
+| `virtual`| `https://bucket.endpoint/key`        | AWS S3 (default), virtual-host services  |
+| `auto`   | endpoint-derived (default)           | Best for mixed setups                    |
+
+`auto` (the default when the flag is empty) picks `virtual` when no
+`--endpoint-url` is set (i.e. you are talking to AWS S3 directly) and `path`
+when a custom endpoint is set, which is what MinIO/OSS/COS/GCS expect. An
+explicit `--addressing-style=path|virtual` always wins over the auto rule.
+
+The legacy `--path-style` flag (env `S6CMD_USE_PATH_STYLE`) is kept for
+backwards compatibility and is equivalent to `--addressing-style=path`. When
+both are set, `--addressing-style` takes precedence.
+
+S3 Transfer Acceleration is auto-detected: if `--endpoint-url` points at
+`s3-accelerate.amazonaws.com`, s6cmd enables `UseAccelerate` and lets the
+SDK own the endpoint. A `storage.googleapis.com` endpoint is detected as
+GCS so callers can branch on it (GCS defaults to path-style).
 
 ##  Usage
 

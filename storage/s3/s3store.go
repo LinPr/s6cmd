@@ -2,47 +2,239 @@ package s3store
 
 import (
 	"context"
+	"crypto/tls"
+	"errors"
 	"fmt"
+	"net/http"
+	"net/url"
 	"os"
+	"strings"
 
+	"github.com/LinPr/s6cmd/internal/errorpkg"
+	"github.com/LinPr/s6cmd/storage"
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 )
 
+// defaultRegion is used when no region can be inferred from the user, the
+// environment or the bucket itself. AWS treats us-east-1 as the canonical
+// default region.
+const defaultRegion = "us-east-1"
+
+// Addressing-style constants. They mirror the values accepted by the
+// --addressing-style flag (path/virtual/auto). The empty string is treated
+// as "auto" so callers that leave AddressingStyle unset get the historical
+// behaviour: AWS default endpoint → virtual-host, custom endpoint → path.
+const (
+	AddressingStylePath    = "path"
+	AddressingStyleVirtual = "virtual"
+	AddressingStyleAuto    = "auto"
+)
+
+// Endpoint hostnames that require special handling.
+const (
+	// transferAccelEndpoint is the Amazon S3 Transfer Acceleration endpoint.
+	// When the user supplies it we let the SDK own the endpoint (set the
+	// parsed URL back to the sentinel) and enable UseAccelerate.
+	transferAccelEndpoint = "s3-accelerate.amazonaws.com"
+	// gcsEndpoint is the Google Cloud Storage S3-compatible endpoint. It is
+	// recorded here so callers can branch on it; GCS only supports path-style
+	// addressing via the JSON API but the S3 XML interop path also expects
+	// path-style by default.
+	gcsEndpoint = "storage.googleapis.com"
+)
+
+// sentinelURL is the zero value of url.URL. parseEndpoint returns it for an
+// empty input so downstream code can distinguish "no endpoint supplied"
+// (AWS default) from a custom endpoint.
+var sentinelURL = url.URL{}
+
+// parseEndpoint parses the given endpoint URL. An empty endpoint yields the
+// sentinel, signalling "use the AWS SDK default endpoint". A parse error is
+// reported with the original input so the caller can surface a useful
+// message.
+func parseEndpoint(endpoint string) (url.URL, error) {
+	if endpoint == "" {
+		return sentinelURL, nil
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return sentinelURL, fmt.Errorf("parse endpoint %q: %v", endpoint, err)
+	}
+	return *u, nil
+}
+
+// supportsTransferAcceleration reports whether endpoint points at the S3
+// Transfer Acceleration hostname. When true the caller should set
+// s3.Options.UseAccelerate = true and stop overriding the endpoint (the SDK
+// derives the correct accelerate URL from the bucket name).
+func supportsTransferAcceleration(endpoint url.URL) bool {
+	return endpoint.Hostname() == transferAccelEndpoint
+}
+
+// isGoogleEndpoint reports whether endpoint points at the GCS S3-compatible
+// endpoint. GCS does not support virtual-host-style bucket addressing via
+// the S3 XML API, so callers should force path-style unless the user
+// explicitly overrides via --addressing-style=virtual.
+func isGoogleEndpoint(endpoint url.URL) bool {
+	return endpoint.Hostname() == gcsEndpoint
+}
+
+// forcedVirtualHostStyle reports whether the user explicitly requested
+// virtual-host addressing via --addressing-style=virtual. An explicit choice
+// always wins over the auto-detected default.
+func forcedVirtualHostStyle(endpoint url.URL, addressingStyle string) bool {
+	return addressingStyle == AddressingStyleVirtual
+}
+
+// isVirtualHostStyle decides whether the client should use virtual-host
+// addressing. Rules (in priority order):
+//
+//  1. addressingStyle == "virtual"            → virtual-host (user forced it)
+//  2. addressingStyle == "path"               → path-style   (user forced it)
+//  3. endpoint == sentinel (no custom URL)    → virtual-host (AWS default)
+//  4. otherwise (custom endpoint, "auto"/"")  → path-style
+//     (MinIO/OSS/COS/GCS and friends default to path-style)
+//
+// Backwards compatibility: when addressingStyle is empty and the caller
+// already set UsePathStyle=true (the legacy knob), NewS3Client translates
+// that to AddressingStylePath before calling this function.
+func isVirtualHostStyle(endpoint url.URL, addressingStyle string) bool {
+	if addressingStyle == AddressingStylePath {
+		return false
+	}
+	if endpoint == sentinelURL {
+		// No custom endpoint → AWS default endpoint → virtual-host.
+		return true
+	}
+	// Custom endpoint: respect an explicit "virtual", otherwise default to
+	// path-style which is what MinIO/OSS/COS/GCS expect.
+	return forcedVirtualHostStyle(endpoint, addressingStyle)
+}
+
+// S3Store is the storage.Storage implementation for S3.
 type S3Store struct {
 	client     *s3.Client
 	uploader   *manager.Uploader
 	downloader *manager.Downloader
+	presigner  *s3.PresignClient
+
+	// dryRun, when true, makes mutating operations no-ops.
+	dryRun bool
+	// useListObjectsV1 selects the legacy ListObjects API instead of
+	// ListObjectsV2 (useful for services that do not implement V2).
+	useListObjectsV1 bool
+	// requestPayerFlag, when non-empty, is sent as RequestPayer on every
+	// request that supports it.
+	requestPayerFlag string
+	// noSuchUploadRetryCount caps the number of times Put retries an upload
+	// that failed with NoSuchUpload. See Put/retryOnNoSuchUpload.
+	noSuchUploadRetryCount int
 }
 
+// metadataKeyRetryID is the object metadata key that carries the per-upload
+// retry id. On a NoSuchUpload error the store Stats the target and compares
+// the value of this metadata to the id sent with the upload: a match means
+// a previous attempt actually succeeded despite the error, so Put returns
+// nil instead of retrying. Mirrors s5cmd's s5cmd-upload-retry-id.
+const metadataKeyRetryID = "s6cmd-upload-retry-id"
+
+// newRetryer builds the SDK v2 retryer. It starts from retry.NewStandard
+// (which already covers throttling, 5xx, RequestTimeout, connection errors,
+// etc.) and layers on the s5cmd-style extra retryable error codes
+// (InternalError, RequestTimeTooSkewed, SlowDown) plus a deny-list for the
+// token errors (ExpiredToken, ExpiredTokenException, InvalidToken) which
+// must NOT be retried even if the standard rules would allow it.
+//
+// MaxAttempts is set via retry.AddWithMaxAttempts. A non-positive max
+// leaves the SDK default in place.
+func newRetryer(max int) aws.Retryer {
+	std := retry.NewStandard(func(o *retry.StandardOptions) {
+		if max > 0 {
+			o.MaxAttempts = max
+		}
+		// Append the s5cmd-style extra retryable codes. StandardOptions
+		// already seeds Retryables with DefaultRetryables, so we append
+		// rather than replace.
+		o.Retryables = append(o.Retryables, retry.IsErrorRetryableFunc(func(err error) aws.Ternary {
+			if err == nil {
+				return aws.UnknownTernary
+			}
+			var apiErr smithy.APIError
+			if !errors.As(err, &apiErr) {
+				return aws.UnknownTernary
+			}
+			switch apiErr.ErrorCode() {
+			case "InternalError", "RequestTimeTooSkewed", "SlowDown":
+				return aws.TrueTernary
+			case "ExpiredToken", "ExpiredTokenException", "InvalidToken":
+				return aws.FalseTernary
+			}
+			// "connection reset"/"connection timed out" are not separate
+			// error codes; they appear inside the error message. The v2
+			// standard retryer already handles "connection reset" via
+			// RetryableConnectionError, so we only add the timed-out
+			// variant here for parity with s5cmd.
+			if strings.Contains(apiErr.ErrorMessage(), "connection timed out") {
+				return aws.TrueTernary
+			}
+			return aws.UnknownTernary
+		}))
+	})
+	return std
+}
+
+// NewS3Client builds an S3Store from the given options. If Region is empty
+// the region is auto-detected via manager.GetBucketRegion when the option
+// carries a bucket hint; otherwise the SDK default (us-east-1) is used.
+//
+// Addressing-style resolution (see isVirtualHostStyle for the full rules):
+//   - AddressingStyle takes precedence; "path"/"virtual" are forced, "auto"
+//     and "" fall through to the endpoint-derived default.
+//   - UsePathStyle is a backwards-compatible fallback: when AddressingStyle
+//     is empty and UsePathStyle is true, the option is treated as "path".
+//   - A transfer-acceleration endpoint enables s3.Options.UseAccelerate and
+//     the SDK owns the endpoint (the parsed URL is reset to the sentinel).
+//   - A custom endpoint (MinIO/OSS/COS/GCS/...) defaults to path-style.
 func NewS3Client(ctx context.Context, option S3Option) (*S3Store, error) {
+	// Normalise the addressing style. Empty defaults to "auto" so the
+	// endpoint-derived rule applies; legacy callers that only set
+	// UsePathStyle=true are mapped onto "path".
+	addressing := option.AddressingStyle
+	if addressing == "" {
+		if option.UsePathStyle {
+			addressing = AddressingStylePath
+		} else {
+			addressing = AddressingStyleAuto
+		}
+	}
+	switch addressing {
+	case AddressingStylePath, AddressingStyleVirtual, AddressingStyleAuto:
+		// ok
+	default:
+		return nil, fmt.Errorf("invalid addressing-style %q: want one of path, virtual, auto", addressing)
+	}
 
-	// customResolver2 := s3.EndpointResolverFunc(func(region string, options s3.EndpointResolverOptions) (aws.Endpoint, error) {
-	// 	return aws.Endpoint{
-	// 		URL:           "http://oss-cn-hangzhou.aliyuncs.com",
-	// 		SigningRegion: "cn-hangzhou",
-	// 	}, nil
-	// })
+	endpointURL, err := parseEndpoint(option.Endpoint)
+	if err != nil {
+		return nil, err
+	}
 
-	// Create custom endpoint resolver
-	// customResolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
-	// 	return aws.Endpoint{
-	// 		URL: "https://obs.cn-east-3.myhuaweicloud.com",
-	// 		// URL:           "http://oss-cn-hangzhou.aliyuncs.com",
-	// 		SigningRegion: "cn-hangzhou",
-	// 	}, nil
-	// })
+	// Transfer acceleration: let the SDK own the endpoint. Keeping the
+	// parsed accelerate URL would cause bucket operations to fail because
+	// the SDK derives the accelerate hostname itself from the bucket name.
+	useAccelerate := supportsTransferAcceleration(endpointURL)
+	if useAccelerate {
+		endpointURL = sentinelURL
+	}
 
-	// envCredential, err := NewEnvironmentVariableCredentials()
-	// if err != nil {
-	// 	return nil, err
-	// }
-	// provider := NewAwsS3Provider(envCredential)
-
-	// Load default config with custom endpoint resolver
+	virtualHost := isVirtualHostStyle(endpointURL, addressing)
 
 	var optFns []func(*config.LoadOptions) error
 	if option.Region != "" {
@@ -51,57 +243,113 @@ func NewS3Client(ctx context.Context, option S3Option) (*S3Store, error) {
 	if option.Profile != "" {
 		optFns = append(optFns, config.WithSharedConfigProfile(option.Profile))
 	}
+	if option.CredentialFile != "" {
+		optFns = append(optFns, config.WithSharedConfigFiles([]string{option.CredentialFile}))
+	}
+	if option.MaxRetries > 0 {
+		retryer := newRetryer(option.MaxRetries)
+		optFns = append(optFns, config.WithRetryer(func() aws.Retryer { return retryer }))
+	}
+	if option.NoVerifySSL {
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		if transport.TLSClientConfig == nil {
+			transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+		} else {
+			transport.TLSClientConfig.InsecureSkipVerify = true
+		}
+		httpClient := &http.Client{Transport: transport}
+		optFns = append(optFns, config.WithHTTPClient(httpClient))
+	}
+	// Custom endpoint (non-accelerate). HostnameImmutable=true keeps the
+	// SDK from rewriting the host when virtual-host addressing kicks in,
+	// which is what most S3-compatible services expect.
+	if endpointURL != sentinelURL {
+		resolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
+			return aws.Endpoint{
+				URL:               endpointURL.String(),
+				SigningRegion:     region,
+				HostnameImmutable: true,
+			}, nil
+		})
+		optFns = append(optFns, config.WithEndpointResolverWithOptions(resolver))
+	}
 
 	conf, err := config.LoadDefaultConfig(ctx, optFns...)
-	// config.WithRegion("cn-hangzhou"),
-	// config.WithEndpointResolverWithOptions(customResolver),
-	// config.WithCredentialsProvider(provider),
-
 	if err != nil {
 		return nil, err
 	}
-	// test, err := config.LoadSharedConfigProfile(ctx, "default")
-	// if err != nil {
-	// 	log.Println("load shared config profile failed:", err)
-	// }
 
-	// j, _ := json.MarshalIndent(test, "", "  ")
-	// fmt.Printf("j: %v\n", string(j))
+	// Region auto-detection: when the user did not specify a region but did
+	// specify a bucket (e.g. via NewRemoteClient), probe the bucket's region
+	// via manager.GetBucketRegion. The probe is best-effort; on failure we
+	// fall back to the SDK's configured region or us-east-1.
+	if option.Region == "" && option.bucket != "" {
+		if region, err := manager.GetBucketRegion(ctx, s3.NewFromConfig(conf), option.bucket); err == nil && region != "" {
+			conf.Region = region
+		} else if option.bucket == "" {
+			conf.Region = defaultRegion
+		}
+	}
+	if conf.Region == "" {
+		conf.Region = defaultRegion
+	}
 
-	fmt.Printf("option.UsePathStyle: %v\n", option.UsePathStyle)
-	client := s3.NewFromConfig(conf,
-		func(o *s3.Options) {
-			o.UsePathStyle = option.UsePathStyle
-		},
-	)
+	client := s3.NewFromConfig(conf, func(o *s3.Options) {
+		o.UsePathStyle = !virtualHost
+		o.UseAccelerate = useAccelerate
+		if option.NoSignRequest {
+			o.Credentials = nil // anonymous credentials
+		}
+	})
+
 	uploader := manager.NewUploader(client)
 	downloader := manager.NewDownloader(client)
+	presigner := s3.NewPresignClient(client)
 
 	return &S3Store{
-		client:     client,
-		uploader:   uploader,
-		downloader: downloader,
+		client:                 client,
+		uploader:               uploader,
+		downloader:             downloader,
+		presigner:              presigner,
+		dryRun:                 option.DryRun,
+		useListObjectsV1:       option.UseListObjectsV1,
+		requestPayerFlag:       option.RequestPayer,
+		noSuchUploadRetryCount: option.NoSuchUploadRetryCount,
 	}, nil
 }
 
+// requestPayer returns the RequestPayer value to send on supporting
+// requests, or the zero value (omitted by the SDK) when unset.
+func (s *S3Store) requestPayer() types.RequestPayer {
+	if s.requestPayerFlag == "" {
+		return ""
+	}
+	return types.RequestPayer(s.requestPayerFlag)
+}
+
+// Client returns the underlying S3 client. It is exposed so that commands
+// needing direct access to the paginator constructors (e.g. cmd/du building a
+// ListObjectsV2Paginator in-place to accumulate Size fields) can do so without
+// each command re-implementing the client configuration. Callers must not
+// mutate the client.
+func (s *S3Store) Client() *s3.Client {
+	return s.client
+}
+
+// Credentials is a small static-credentials helper used by callers that
+// build their own config (kept for backwards compatibility).
 type Credentials struct {
 	AccessKeyId     string
 	AccessKeySecret string
 	SecurityToken   string
 }
 
-func (credentials *Credentials) GetAccessKeyID() string {
-	return credentials.AccessKeyId
-}
+func (c *Credentials) GetAccessKeyID() string     { return c.AccessKeyId }
+func (c *Credentials) GetAccessKeySecret() string { return c.AccessKeySecret }
+func (c *Credentials) GetSecurityToken() string   { return c.SecurityToken }
 
-func (credentials *Credentials) GetAccessKeySecret() string {
-	return credentials.AccessKeySecret
-}
-
-func (credentials *Credentials) GetSecurityToken() string {
-	return credentials.SecurityToken
-}
-
+// NewAwsS3Provider wraps the given credentials as a static credentials
+// provider.
 func NewAwsS3Provider(credential *Credentials) credentials.StaticCredentialsProvider {
 	return credentials.StaticCredentialsProvider{
 		Value: aws.Credentials{
@@ -112,22 +360,61 @@ func NewAwsS3Provider(credential *Credentials) credentials.StaticCredentialsProv
 	}
 }
 
+// NewEnvironmentVariableCredentials reads OSS_* env vars and returns a
+// Credentials value. It is kept for legacy callers.
 func NewEnvironmentVariableCredentials() (*Credentials, error) {
-	var envCredential *Credentials
 	accessID := os.Getenv("OSS_ACCESS_KEY_ID")
 	if accessID == "" {
-		return envCredential, fmt.Errorf("access key id is empty!")
+		return nil, errors.New("access key id is empty")
 	}
 	accessKey := os.Getenv("OSS_ACCESS_KEY_SECRET")
 	if accessKey == "" {
-		return envCredential, fmt.Errorf("access key secret is empty!")
+		return nil, errors.New("access key secret is empty")
 	}
 	token := os.Getenv("OSS_SESSION_TOKEN")
-	envCredential = &Credentials{
+	return &Credentials{
 		AccessKeyId:     accessID,
 		AccessKeySecret: accessKey,
 		SecurityToken:   token,
-	}
-
-	return envCredential, nil
+	}, nil
 }
+
+// errNotFound reports whether err is an S3 NotFound / NoSuchKey response.
+func errNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	var nf *types.NotFound
+	if errors.As(err, &nf) {
+		return true
+	}
+	var noKey *types.NoSuchKey
+	if errors.As(err, &noKey) {
+		return true
+	}
+	// some S3-compatible services return a generic smithy.APIError with
+	// code "NotFound" or "NoSuchKey" instead of the typed variant.
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "NotFound", "NoSuchKey":
+			return true
+		}
+	}
+	return false
+}
+
+// statObjectNotFound returns the canonical ErrGivenObjectNotFound for the
+// given URL when the underlying Head/Get returned a not-found error.
+func statObjectNotFound(url *storage.StorageURL, err error) error {
+	if err == nil {
+		return nil
+	}
+	if errNotFound(err) {
+		return errorpkg.ErrGivenObjectNotFound
+	}
+	return err
+}
+
+// trimEtag strips the surrounding quotes that S3 wraps around ETag values.
+func trimEtag(v string) string { return strings.Trim(v, `"`) }

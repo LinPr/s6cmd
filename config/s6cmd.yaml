@@ -1,0 +1,50 @@
+# s6cmd example configuration file
+#
+# s6cmd resolves settings in this order (highest priority first):
+#   1. command-line flag (e.g. --region us-east-1)
+#   2. environment variable (e.g. AWS_REGION, S6CMD_USE_PATH_STYLE, ...)
+#   3. this config file
+#   4. cobra flag default
+#
+# Pass --config /path/to/s6cmd.yaml or set S6CMD_CONFIG to load a different
+# file. With no --config flag, s6cmd searches ~/.s6cmd.yaml, ./config/s6cmd.yaml,
+# and ./s6cmd.yaml in that order.
+#
+# Every key below mirrors the long flag name; dashes are kept as-is in YAML.
+
+# Override the AWS service endpoint URL. Use this for MinIO, OSS, COS, GCS,
+# and other S3-compatible services. Env: AWS_ENDPOINT_URL_S3.
+endpoint-url: ""
+
+# AWS region. When empty, the SDK auto-detects via GetBucketRegion and falls
+# back to us-east-1. Env: AWS_REGION.
+region: ""
+
+# Named profile from the shared credentials file (~/.aws/credentials).
+# Env: AWS_PROFILE.
+profile: ""
+
+# Disable TLS certificate verification. Handy for self-signed MinIO setups,
+# but never use it against a production endpoint. Env: AWS_NO_VERIFY_SSL.
+no-verify-ssl: false
+
+# Disable automatic pagination of List* responses. Useful when you want the
+# raw single-page behaviour. Env: AWS_NO_PAGINATE.
+no-paginate: false
+
+# Output format: one of text, json, table. Env: AWS_OUTPUT.
+output: text
+
+# Force path-style addressing (s3.amazonaws.com/bucket rather than the
+# virtual-host form bucket.s3.amazonaws.com). Required by most S3-compatible
+# services. Equivalent to --addressing-style=path; --addressing-style takes
+# precedence when both are set. Env: S6CMD_USE_PATH_STYLE.
+path-style: false
+
+# Addressing style: one of path, virtual, auto.
+#   path    — always use path-style (https://endpoint/bucket/key).
+#   virtual — always use virtual-host style (https://bucket.endpoint/key).
+#   auto    — endpoint-derived: AWS default endpoint uses virtual-host,
+#             custom endpoint (MinIO/OSS/COS/GCS/...) uses path-style.
+# When empty, "auto" is assumed. Env: S3_ADDRESSING_STYLE.
+addressing-style: ""

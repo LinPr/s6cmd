@@ -118,6 +118,25 @@ func NewStorageURL(s string, opts ...Option) (*StorageURL, error) {
 		return nil, fmt.Errorf("bucket name cannot contain wildcards")
 	}
 
+	// Parse an optional "?versionId=xxx" (case-insensitive) suffix on the key.
+	// The versionId is stored on the URL via the WithVersion option so callers
+	// can still pass their own WithVersion to override it. The "?" is only
+	// treated as a query separator when the query parses cleanly AND contains
+	// a versionId parameter; otherwise the "?" is kept as a glob character
+	// (matching s5cmd semantics, where "?" is a single-char wildcard).
+	if idx := strings.IndexByte(key, '?'); idx >= 0 {
+		rawQuery := key[idx+1:]
+		if q, err := url.ParseQuery(rawQuery); err == nil {
+			for name, vals := range q {
+				if strings.EqualFold(name, "versionId") && len(vals) > 0 && vals[0] != "" {
+					opts = append([]Option{WithVersion(vals[0])}, opts...)
+					key = key[:idx]
+					break
+				}
+			}
+		}
+	}
+
 	url := &StorageURL{
 		Type:   remoteObject,
 		Scheme: "s3",
@@ -335,6 +354,18 @@ func (u *StorageURL) SetRelative(base *StorageURL) {
 	}
 	baseDir := filepath.Dir(basePath)
 	u.relativePath, _ = filepath.Rel(baseDir, u.Absolute())
+}
+
+// SetRelativePath explicitly sets the relative path to the given string.
+// It is the caller's responsibility to ensure rel is a sensible relative
+// path (e.g. the object key with the listing prefix stripped). Callers
+// that walk a source tree should prefer SetRelative, which derives the
+// relative path from a base URL; SetRelativePath is for cases where the
+// caller already knows the relative path and wants to override the
+// match-derived one (notably when re-listing an S3 prefix with a cleared
+// delimiter so the relative path is the full key minus the prefix).
+func (u *StorageURL) SetRelativePath(rel string) {
+	u.relativePath = rel
 }
 
 // Match reports whether if given key matches with the object.
