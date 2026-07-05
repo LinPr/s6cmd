@@ -27,7 +27,7 @@ func newS3StoreForTest(t *testing.T, serverURL string, noSuchUploadRetryCount in
 	t.Helper()
 	store, err := NewS3Client(context.Background(), S3Option{
 		Endpoint:               serverURL,
-		AddressingStyle:        AddressingStylePath,
+		UsePathStyle:           true,
 		NoSignRequest:          true,
 		NoSuchUploadRetryCount: noSuchUploadRetryCount,
 		MaxRetries:             1,

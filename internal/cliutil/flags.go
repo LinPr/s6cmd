@@ -13,10 +13,6 @@ type CommonFlags struct {
 	Profile     string
 	Region      string
 	PathStyle   bool
-	// AddressingStyle mirrors the --addressing-style flag. Empty means
-	// "auto" (endpoint-derived). PathStyle is kept for backwards
-	// compatibility; when AddressingStyle is non-empty it wins.
-	AddressingStyle string
 	// RetryCount is the --retry-count value (AWS_RETRY_COUNT env). When
 	// non-positive the SDK default retryer is used.
 	RetryCount int
@@ -110,13 +106,6 @@ func LoadParentFlags(cmd *cobra.Command) CommonFlags {
 			flags.PathStyle, _ = parentFlags.GetBool("path-style")
 		} else if viper.IsSet("path-style") {
 			flags.PathStyle = viper.GetBool("path-style")
-		}
-	}
-	if flag := parentFlags.Lookup("addressing-style"); flag != nil {
-		if flag.Changed {
-			flags.AddressingStyle, _ = parentFlags.GetString("addressing-style")
-		} else if v := viper.GetString("addressing-style"); v != "" {
-			flags.AddressingStyle = v
 		}
 	}
 	if flag := parentFlags.Lookup("retry-count"); flag != nil {

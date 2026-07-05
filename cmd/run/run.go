@@ -324,9 +324,6 @@ func globalFlagArgs(cf cliutil.CommonFlags) []string {
 	if cf.PathStyle {
 		args = append(args, "--path-style")
 	}
-	if cf.AddressingStyle != "" {
-		args = append(args, "--addressing-style", cf.AddressingStyle)
-	}
 	if cf.RetryCount > 0 {
 		args = append(args, "--retry-count", fmt.Sprintf("%d", cf.RetryCount))
 	}

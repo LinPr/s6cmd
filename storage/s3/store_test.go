@@ -598,8 +598,8 @@ func TestPresign(t *testing.T) {
 
 	srv, backend := newMockS3Server(t)
 	store, err := NewS3Client(context.Background(), S3Option{
-		Endpoint:        srv.URL,
-		AddressingStyle: AddressingStylePath,
+		Endpoint:      srv.URL,
+		UsePathStyle:  true,
 		// NoSignRequest left false so the SDK installs the SigV4 signer
 		// that Presign needs. The mock server ignores Authorization.
 		Region:     "us-east-1",
@@ -643,7 +643,7 @@ func TestPresign(t *testing.T) {
 // =========================================================================
 
 // TestNewS3Client_PathStyle asserts the SDK sends requests with the bucket
-// in the URL path (not the Host header) when AddressingStyle=path. The mock
+// in the URL path (not the Host header) when UsePathStyle=true. The mock
 // records every request so we can inspect the path after a Stat call.
 func TestNewS3Client_PathStyle(t *testing.T) {
 	t.Parallel()
@@ -687,16 +687,15 @@ func TestNewS3Client_PathStyle(t *testing.T) {
 	}
 }
 
-// TestNewS3Client_VirtualHostStyle asserts the SDK puts the bucket in the
-// Host header when AddressingStyle=virtual. Because NewS3Client sets
-// HostnameImmutable=true on the custom endpoint resolver (to keep the SDK
-// from rewriting the host for S3-compatible services), the SDK keeps the
-// mock server's host as-is and the bucket stays in the URL path. We
-// therefore cannot assert the Host header directly on a custom endpoint;
-// instead we verify the addressing decision: the resulting client's
-// UsePathStyle option is false, which is the load-bearing assertion (it
-// means the SDK would rewrite Host to "<bucket>.<host>" if the endpoint
-// resolver had not pinned the hostname).
+// TestNewS3Client_VirtualHostStyle asserts the SDK leaves UsePathStyle=false
+// when the option is unset. Because NewS3Client sets HostnameImmutable=true
+// on the custom endpoint resolver (to keep the SDK from rewriting the host
+// for S3-compatible services), the SDK keeps the mock server's host as-is
+// and the bucket stays in the URL path. We therefore cannot assert the Host
+// header directly on a custom endpoint; instead we verify the addressing
+// decision: the resulting client's UsePathStyle option is false, which is
+// the load-bearing assertion (it means the SDK would rewrite Host to
+// "<bucket>.<host>" if the endpoint resolver had not pinned the hostname).
 //
 // The full virtual-host request shape (bucket-prefixed Host) is exercised
 // end-to-end in the e2e suite against a real gofakes3 server; here we pin
@@ -705,11 +704,10 @@ func TestNewS3Client_VirtualHostStyle(t *testing.T) {
 	t.Parallel()
 	srv, _ := newMockS3Server(t)
 	store, err := NewS3Client(context.Background(), S3Option{
-		Endpoint:        srv.URL,
-		AddressingStyle: AddressingStyleVirtual,
-		NoSignRequest:   true,
-		Region:          "us-east-1",
-		MaxRetries:      1,
+		Endpoint:      srv.URL,
+		NoSignRequest: true,
+		Region:        "us-east-1",
+		MaxRetries:    1,
 	})
 	if err != nil {
 		t.Fatalf("NewS3Client: %v", err)
@@ -719,47 +717,31 @@ func TestNewS3Client_VirtualHostStyle(t *testing.T) {
 	}
 }
 
-// TestNewS3Client_AddressDecisionVsEndpoint is a pure unit test that pins
-// the (endpoint × addressing-style) → UsePathStyle decision table. It is
-// the end-to-end complement to TestIsVirtualHostStyle: the latter tests the
-// helper, this one tests that NewS3Client actually configures the SDK
-// client with the resulting UsePathStyle value.
-func TestNewS3Client_AddressDecisionVsEndpoint(t *testing.T) {
+// TestNewS3Client_UsePathStyle_Passthrough pins that NewS3Client forwards
+// option.UsePathStyle to the SDK client verbatim, regardless of endpoint.
+func TestNewS3Client_UsePathStyle_Passthrough(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		name     string
-		endpoint string
-		style    string
-		wantPath bool // expect UsePathStyle on the resulting client
-		legacy   bool
+		name      string
+		endpoint  string
+		pathStyle bool
+		wantPath  bool
 	}{
-		// No custom endpoint → virtual-host by default (UsePathStyle=false).
-		{name: "sentinel+auto", endpoint: "", style: AddressingStyleAuto, wantPath: false},
-		{name: "sentinel+path", endpoint: "", style: AddressingStylePath, wantPath: true},
-		{name: "sentinel+virtual", endpoint: "", style: AddressingStyleVirtual, wantPath: false},
-
-		// Custom endpoint → path-style unless "virtual" forced.
-		{name: "custom+auto", endpoint: "http://127.0.0.1:9000", style: AddressingStyleAuto, wantPath: true},
-		{name: "custom+path", endpoint: "http://127.0.0.1:9000", style: AddressingStylePath, wantPath: true},
-		{name: "custom+virtual", endpoint: "http://127.0.0.1:9000", style: AddressingStyleVirtual, wantPath: false},
-
-		// Legacy: empty style + UsePathStyle=true is mapped to "path".
-		{name: "custom+legacy-UsePathStyle", endpoint: "http://127.0.0.1:9000", style: "", wantPath: true, legacy: true},
+		{name: "default-virtual", endpoint: "", pathStyle: false, wantPath: false},
+		{name: "explicit-path-custom", endpoint: "http://127.0.0.1:9000", pathStyle: true, wantPath: true},
+		{name: "explicit-virtual-custom", endpoint: "http://127.0.0.1:9000", pathStyle: false, wantPath: false},
+		{name: "path-default-endpoint", endpoint: "", pathStyle: true, wantPath: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			opt := S3Option{
-				Endpoint:        tc.endpoint,
-				AddressingStyle: tc.style,
-				NoSignRequest:   true,
-				Region:          "us-east-1",
-				MaxRetries:      1,
-			}
-			if tc.legacy {
-				opt.AddressingStyle = ""
-				opt.UsePathStyle = true
+				Endpoint:      tc.endpoint,
+				UsePathStyle:  tc.pathStyle,
+				NoSignRequest: true,
+				Region:        "us-east-1",
+				MaxRetries:    1,
 			}
 			store, err := NewS3Client(context.Background(), opt)
 			if err != nil {

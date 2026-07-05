@@ -809,7 +809,7 @@ func newS3Store(t *testing.T, srv *httptest.Server, opts ...func(*S3Option)) *S3
 	t.Helper()
 	opt := S3Option{
 		Endpoint:         srv.URL,
-		AddressingStyle:  AddressingStylePath,
+		UsePathStyle:     true,
 		NoSignRequest:    true,
 		Region:           "us-east-1",
 		MaxRetries:       1,

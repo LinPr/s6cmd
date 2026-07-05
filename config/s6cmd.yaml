@@ -35,16 +35,8 @@ no-paginate: false
 # Output format: one of text, json, table. Env: AWS_OUTPUT.
 output: text
 
-# Force path-style addressing (s3.amazonaws.com/bucket rather than the
-# virtual-host form bucket.s3.amazonaws.com). Required by most S3-compatible
-# services. Equivalent to --addressing-style=path; --addressing-style takes
-# precedence when both are set. Env: S6CMD_USE_PATH_STYLE.
+# Force path-style addressing (https://endpoint/bucket/key rather than the
+# virtual-host form https://bucket.endpoint/key). Required by most
+# S3-compatible services (MinIO, OSS, COS, GCS). Default false uses
+# virtual-host, which is the AWS S3 default. Env: S6CMD_USE_PATH_STYLE.
 path-style: false
-
-# Addressing style: one of path, virtual, auto.
-#   path    — always use path-style (https://endpoint/bucket/key).
-#   virtual — always use virtual-host style (https://bucket.endpoint/key).
-#   auto    — endpoint-derived: AWS default endpoint uses virtual-host,
-#             custom endpoint (MinIO/OSS/COS/GCS/...) uses path-style.
-# When empty, "auto" is assumed. Env: S3_ADDRESSING_STYLE.
-addressing-style: ""

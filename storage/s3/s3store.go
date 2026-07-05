@@ -27,28 +27,10 @@ import (
 // default region.
 const defaultRegion = "us-east-1"
 
-// Addressing-style constants. They mirror the values accepted by the
-// --addressing-style flag (path/virtual/auto). The empty string is treated
-// as "auto" so callers that leave AddressingStyle unset get the historical
-// behaviour: AWS default endpoint → virtual-host, custom endpoint → path.
-const (
-	AddressingStylePath    = "path"
-	AddressingStyleVirtual = "virtual"
-	AddressingStyleAuto    = "auto"
-)
-
-// Endpoint hostnames that require special handling.
-const (
-	// transferAccelEndpoint is the Amazon S3 Transfer Acceleration endpoint.
-	// When the user supplies it we let the SDK own the endpoint (set the
-	// parsed URL back to the sentinel) and enable UseAccelerate.
-	transferAccelEndpoint = "s3-accelerate.amazonaws.com"
-	// gcsEndpoint is the Google Cloud Storage S3-compatible endpoint. It is
-	// recorded here so callers can branch on it; GCS only supports path-style
-	// addressing via the JSON API but the S3 XML interop path also expects
-	// path-style by default.
-	gcsEndpoint = "storage.googleapis.com"
-)
+// transferAccelEndpoint is the Amazon S3 Transfer Acceleration endpoint.
+// When the user supplies it we let the SDK own the endpoint (set the parsed
+// URL back to the sentinel) and enable UseAccelerate.
+const transferAccelEndpoint = "s3-accelerate.amazonaws.com"
 
 // sentinelURL is the zero value of url.URL. parseEndpoint returns it for an
 // empty input so downstream code can distinguish "no endpoint supplied"
@@ -76,46 +58,6 @@ func parseEndpoint(endpoint string) (url.URL, error) {
 // derives the correct accelerate URL from the bucket name).
 func supportsTransferAcceleration(endpoint url.URL) bool {
 	return endpoint.Hostname() == transferAccelEndpoint
-}
-
-// isGoogleEndpoint reports whether endpoint points at the GCS S3-compatible
-// endpoint. GCS does not support virtual-host-style bucket addressing via
-// the S3 XML API, so callers should force path-style unless the user
-// explicitly overrides via --addressing-style=virtual.
-func isGoogleEndpoint(endpoint url.URL) bool {
-	return endpoint.Hostname() == gcsEndpoint
-}
-
-// forcedVirtualHostStyle reports whether the user explicitly requested
-// virtual-host addressing via --addressing-style=virtual. An explicit choice
-// always wins over the auto-detected default.
-func forcedVirtualHostStyle(endpoint url.URL, addressingStyle string) bool {
-	return addressingStyle == AddressingStyleVirtual
-}
-
-// isVirtualHostStyle decides whether the client should use virtual-host
-// addressing. Rules (in priority order):
-//
-//  1. addressingStyle == "virtual"            → virtual-host (user forced it)
-//  2. addressingStyle == "path"               → path-style   (user forced it)
-//  3. endpoint == sentinel (no custom URL)    → virtual-host (AWS default)
-//  4. otherwise (custom endpoint, "auto"/"")  → path-style
-//     (MinIO/OSS/COS/GCS and friends default to path-style)
-//
-// Backwards compatibility: when addressingStyle is empty and the caller
-// already set UsePathStyle=true (the legacy knob), NewS3Client translates
-// that to AddressingStylePath before calling this function.
-func isVirtualHostStyle(endpoint url.URL, addressingStyle string) bool {
-	if addressingStyle == AddressingStylePath {
-		return false
-	}
-	if endpoint == sentinelURL {
-		// No custom endpoint → AWS default endpoint → virtual-host.
-		return true
-	}
-	// Custom endpoint: respect an explicit "virtual", otherwise default to
-	// path-style which is what MinIO/OSS/COS/GCS expect.
-	return forcedVirtualHostStyle(endpoint, addressingStyle)
 }
 
 // S3Store is the storage.Storage implementation for S3.
@@ -194,33 +136,13 @@ func newRetryer(max int) aws.Retryer {
 // the region is auto-detected via manager.GetBucketRegion when the option
 // carries a bucket hint; otherwise the SDK default (us-east-1) is used.
 //
-// Addressing-style resolution (see isVirtualHostStyle for the full rules):
-//   - AddressingStyle takes precedence; "path"/"virtual" are forced, "auto"
-//     and "" fall through to the endpoint-derived default.
-//   - UsePathStyle is a backwards-compatible fallback: when AddressingStyle
-//     is empty and UsePathStyle is true, the option is treated as "path".
-//   - A transfer-acceleration endpoint enables s3.Options.UseAccelerate and
-//     the SDK owns the endpoint (the parsed URL is reset to the sentinel).
-//   - A custom endpoint (MinIO/OSS/COS/GCS/...) defaults to path-style.
+// Addressing: option.UsePathStyle is forwarded to the SDK verbatim.
+//   - true  → path-style (https://endpoint/bucket/key)
+//   - false → virtual-host (https://bucket.endpoint/key), the AWS default
+//
+// A transfer-acceleration endpoint enables s3.Options.UseAccelerate and the
+// SDK owns the endpoint (the parsed URL is reset to the sentinel).
 func NewS3Client(ctx context.Context, option S3Option) (*S3Store, error) {
-	// Normalise the addressing style. Empty defaults to "auto" so the
-	// endpoint-derived rule applies; legacy callers that only set
-	// UsePathStyle=true are mapped onto "path".
-	addressing := option.AddressingStyle
-	if addressing == "" {
-		if option.UsePathStyle {
-			addressing = AddressingStylePath
-		} else {
-			addressing = AddressingStyleAuto
-		}
-	}
-	switch addressing {
-	case AddressingStylePath, AddressingStyleVirtual, AddressingStyleAuto:
-		// ok
-	default:
-		return nil, fmt.Errorf("invalid addressing-style %q: want one of path, virtual, auto", addressing)
-	}
-
 	endpointURL, err := parseEndpoint(option.Endpoint)
 	if err != nil {
 		return nil, err
@@ -233,8 +155,6 @@ func NewS3Client(ctx context.Context, option S3Option) (*S3Store, error) {
 	if useAccelerate {
 		endpointURL = sentinelURL
 	}
-
-	virtualHost := isVirtualHostStyle(endpointURL, addressing)
 
 	var optFns []func(*config.LoadOptions) error
 	if option.Region != "" {
@@ -295,7 +215,7 @@ func NewS3Client(ctx context.Context, option S3Option) (*S3Store, error) {
 	}
 
 	client := s3.NewFromConfig(conf, func(o *s3.Options) {
-		o.UsePathStyle = !virtualHost
+		o.UsePathStyle = option.UsePathStyle
 		o.UseAccelerate = useAccelerate
 		if option.NoSignRequest {
 			o.Credentials = nil // anonymous credentials

@@ -10,16 +10,14 @@ type S3Option struct {
 	// Status: implemented.
 	Region string
 
-	// UsePathStyle forces path-style addressing (s3.amazonaws.com/bucket
-	// instead of bucket.s3.amazonaws.com). Required for MinIO and many
-	// S3-compatible services.
+	// UsePathStyle selects the S3 addressing style.
+	//   - true:  force path-style addressing (https://endpoint/bucket/key).
+	//           Required for MinIO, Alibaba OSS, Tencent COS, GCS and most
+	//           S3-compatible services.
+	//   - false (default): virtual-host addressing
+	//           (https://bucket.endpoint/key), which is the AWS S3 default.
 	//
-	// This field is kept for backwards compatibility. AddressingStyle takes
-	// precedence when set: an empty AddressingStyle plus UsePathStyle=true
-	// is treated as AddressingStyle="path". New callers should set
-	// AddressingStyle directly.
-	//
-	// Status: implemented (legacy).
+	// Status: implemented.
 	UsePathStyle bool
 
 	// Profile selects a named profile from the shared credentials file.
@@ -94,17 +92,6 @@ type S3Option struct {
 	//
 	// Status: implemented.
 	CredentialFile string
-
-	// AddressingStyle selects "path", "virtual" or "auto" addressing.
-	//   - "path": force path-style (https://endpoint/bucket/key).
-	//   - "virtual": force virtual-host style (https://bucket.endpoint/key).
-	//   - "auto" or "": endpoint-derived — AWS default endpoint uses
-	//     virtual-host, custom endpoints use path-style.
-	//
-	// AddressingStyle takes precedence over the legacy UsePathStyle field.
-	//
-	// Status: implemented.
-	AddressingStyle string
 
 	// UseAccelerate enables S3 Transfer Acceleration. When nil/false the
 	// value is auto-detected from the endpoint (an s3-accelerate.amazonaws.com

@@ -44,8 +44,6 @@ type Options struct {
 	Profile     string
 	Region      string
 	PathStyle   bool
-	// AddressingStyle mirrors --addressing-style. Empty = auto.
-	AddressingStyle string
 	// RetryCount mirrors --retry-count. <=0 leaves the SDK default.
 	RetryCount int
 	// NoSuchUploadRetryCount mirrors --no-such-upload-retry-count (hidden).
@@ -97,7 +95,6 @@ func (o *Options) complete(root *cobra.Command) error {
 	setString("output", "output", &o.Output)
 	setString("profile", "profile", &o.Profile)
 	setString("region", "region", &o.Region)
-	setString("addressing-style", "addressing-style", &o.AddressingStyle)
 	setString("credentials-file", "credentials-file", &o.CredentialsFile)
 	setBool("no-verify-ssl", "no-verify-ssl", &o.NoVerifySSL)
 	setBool("no-paginate", "no-paginate", &o.NoPaginate)
@@ -190,8 +187,7 @@ func NewRootCmd() *cobra.Command {
 	cmd.PersistentFlags().StringVarP(&o.Output, "output", "o", "text", "Set output format. One of: json, text, table (or use AWS_OUTPUT environment variable)")
 	cmd.PersistentFlags().StringVarP(&o.Profile, "profile", "p", "", "Use a specific profile from your credential file (or use AWS_PROFILE environment variable)")
 	cmd.PersistentFlags().StringVar(&o.Region, "region", "", "The region to use. Overrides config/env settings (or use AWS_REGION environment variable)")
-	cmd.PersistentFlags().BoolVarP(&o.PathStyle, "path-style", "", false, "Force to use path style addressing (or use S6CMD_USE_PATH_STYLE environment variable). Equivalent to --addressing-style=path; --addressing-style takes precedence when both are set.")
-	cmd.PersistentFlags().StringVar(&o.AddressingStyle, "addressing-style", "", "Use virtual host style or path style endpoint: (path, virtual, auto). Auto is endpoint-derived: AWS default → virtual-host, custom endpoint → path-style. Env: S3_ADDRESSING_STYLE.")
+	cmd.PersistentFlags().BoolVarP(&o.PathStyle, "path-style", "", false, "Force path-style addressing (https://endpoint/bucket/key). Required for MinIO, OSS, COS, GCS. Env: S6CMD_USE_PATH_STYLE.")
 	cmd.PersistentFlags().IntVar(&o.RetryCount, "retry-count", 10, "number of times that a request will be retried for failures (or use AWS_RETRY_COUNT environment variable)")
 	cmd.PersistentFlags().IntVar(&o.NoSuchUploadRetryCount, "no-such-upload-retry-count", 0, "number of times that a request will be retried on NoSuchUpload error; you should not use this unless you really know what you're doing (or use AWS_NO_SUCH_UPLOAD_RETRY_COUNT environment variable)")
 	_ = cmd.PersistentFlags().Lookup("no-such-upload-retry-count")
@@ -229,9 +225,6 @@ func NewRootCmd() *cobra.Command {
 	if err := viper.BindPFlag("path-style", cmd.PersistentFlags().Lookup("path-style")); err != nil {
 		panic(err)
 	}
-	if err := viper.BindPFlag("addressing-style", cmd.PersistentFlags().Lookup("addressing-style")); err != nil {
-		panic(err)
-	}
 	if err := viper.BindPFlag("retry-count", cmd.PersistentFlags().Lookup("retry-count")); err != nil {
 		panic(err)
 	}
@@ -256,7 +249,6 @@ func NewRootCmd() *cobra.Command {
 		{"profile", "AWS_PROFILE"},
 		{"region", "AWS_REGION"},
 		{"path-style", "S6CMD_USE_PATH_STYLE"},
-		{"addressing-style", "S3_ADDRESSING_STYLE"},
 		{"config", "S6CMD_CONFIG"},
 		{"retry-count", "AWS_RETRY_COUNT"},
 		{"no-such-upload-retry-count", "AWS_NO_SUCH_UPLOAD_RETRY_COUNT"},

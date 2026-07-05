@@ -29,18 +29,11 @@ func NewS3Client(ctx context.Context, flags CommonFlags) (*s3store.S3Store, erro
 }
 
 // s3OptFromFlags translates the shared CommonFlags into an S3Option.
-//
-// AddressingStyle takes precedence over the legacy PathStyle flag. When the
-// user only set --path-style (no --addressing-style), we map it onto
-// AddressingStyle=path so the rest of the code only has one knob to read.
+// UsePathStyle is the single addressing knob: true forces path-style
+// (MinIO/OSS/COS/GCS), false (default) uses virtual-host (AWS S3).
 func s3OptFromFlags(flags CommonFlags) s3store.S3Option {
-	addressing := flags.AddressingStyle
-	if addressing == "" && flags.PathStyle {
-		addressing = s3store.AddressingStylePath
-	}
 	return s3store.S3Option{
-		AddressingStyle:        addressing,
-		UsePathStyle:           flags.PathStyle, // kept for callers that still read it directly
+		UsePathStyle:           flags.PathStyle,
 		Region:                 flags.Region,
 		Profile:                flags.Profile,
 		Endpoint:               flags.EndpointURL,
