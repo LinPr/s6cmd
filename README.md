@@ -1,10 +1,8 @@
 # s6cmd
 
-[![Version](https://img.shields.io/github/v/release/LinPr/s6cmd?include_prereleases)](https://github.com/LinPr/s6cmd/releases/tag/v0.0.4)
 [![Go Version](https://img.shields.io/github/go-mod/go-version/LinPr/s6cmd)](https://golang.org/)
 [![License](https://img.shields.io/github/license/LinPr/s6cmd)](LICENSE)
 
-*Pre-release (v0.0.4). s6cmd is under active development — do not use it in production.*
 
 s6cmd is a command-line tool for Amazon S3, built on [aws-sdk-go-v2](https://github.com/aws/aws-sdk-go-v2). It is inspired by popular S3 CLI tools and aims for similar functionality with improved performance and a modern Go architecture.
 
@@ -12,8 +10,29 @@ s6cmd is a command-line tool for Amazon S3, built on [aws-sdk-go-v2](https://git
 
 20 commands covering bucket and object operations:
 
-- **Bucket:** `mb`, `rb`, `ls` (`--recursive`, `--humanize`, `--summarize`, `--etag`, `--storage-class`, `--show-fullpath`, `--all-versions`), `bucket-version` (`--set Enabled|Suspended`)
-- **Object:** `put` (stdin with `-`), `get` (`--recursive`, `--jobs`), `cp` (S3↔S3 / S3↔local, with `--no-clobber`, `--if-size-differ`, `--if-source-newer`, `--flatten`, `--exclude`/`--include`, `--storage-class`, `--metadata`, `--sse`, `--concurrency`, `--part-size`), `mv` (copy + delete, same shared flags), `rm` (`--recursive`, `--exclude`/`--include`, `--all-versions`, `--version-id`), `sync` (`--delete`, `--size-only`, `--exit-on-error`), `stat`, `du` (`--group`, `--humanize`, `--exclude`), `cat` (streamed, wildcards), `head` (JSON), `presign` (`--expire`), `pipe` (stdin → object), `tree`, `select` (SQL via `csv`/`json`/`parquet`), `run` (batch from file/stdin), `version`
+### Bucket Operations
+- `mb` — create bucket
+- `rb` — remove bucket
+- `ls` — list buckets/objects (`--recursive`, `--humanize`, `--summarize`, `--etag`, `--storage-class`, `--show-fullpath`, `--all-versions`)
+- `bucket-version` — manage bucket versioning (`--set Enabled|Suspended`)
+
+### Object Operations
+- `put` — upload object (stdin with `-`)
+- `get` — download object (`--recursive`, `--jobs`)
+- `cp` — copy S3↔S3 / S3↔local (`--no-clobber`, `--if-size-differ`, `--if-source-newer`, `--flatten`, `--exclude`/`--include`, `--storage-class`, `--metadata`, `--sse`, `--concurrency`, `--part-size`)
+- `mv` — move object (copy + delete, same shared flags as `cp`)
+- `rm` — delete object (`--recursive`, `--exclude`/`--include`, `--all-versions`, `--version-id`)
+- `sync` — sync directories (`--delete`, `--size-only`, `--exit-on-error`)
+- `stat` — object metadata
+- `du` — disk usage (`--group`, `--humanize`, `--exclude`)
+- `cat` — stream object content (supports wildcards)
+- `head` — show object metadata (JSON)
+- `presign` — generate presigned URL (`--expire`)
+- `pipe` — upload from stdin
+- `tree` — tree view of bucket
+- `select` — SQL query on object (`csv`/`json`/`parquet`)
+- `run` — batch commands from file/stdin
+- `version` — show version
 
 ## Installation
 
