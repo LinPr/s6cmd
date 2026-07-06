@@ -22,12 +22,19 @@ var (
 
 // Init raises the soft RLIMIT_NOFILE and constructs the global Manager.
 // If workercount is non-positive, defaultWorkerCount is used.
-func Init(workercount int) {
+//
+// The returned error is the fdlimit.Raise failure, if any. The Manager is
+// constructed regardless, so callers may treat the error as advisory (the
+// process still runs, just with less file-descriptor headroom). It is
+// returned instead of logged here because Init runs before the logger is
+// configured from the parsed flags; main logs it at debug level.
+func Init(workercount int) error {
 	if workercount <= 0 {
 		workercount = defaultWorkerCount
 	}
-	_ = fdlimit.Raise()
+	err := fdlimit.Raise()
 	global = New(workercount)
+	return err
 }
 
 // Close waits for all in-flight tasks on the global Manager to finish

@@ -25,7 +25,7 @@ func HumanizeBytes(b int64) string {
 		div    int64
 	)
 	for _, f := range humanDivisors {
-		if b > f.div {
+		if b >= f.div {
 			suffix = f.suffix
 			div = f.div
 		}
@@ -35,6 +35,16 @@ func HumanizeBytes(b int64) string {
 	}
 
 	return fmt.Sprintf("%.1f%s", float64(b)/float64(div), suffix)
+}
+
+// TrimQuotes strips matching pairs of surrounding quotes (single or double)
+// from v. It is used to clean the ETag values S3 wraps in double quotes
+// before they are shown to the user or compared.
+func TrimQuotes(v string) string {
+	for len(v) >= 2 && (v[0] == '"' || v[0] == '\'') && v[len(v)-1] == v[0] {
+		v = v[1 : len(v)-1]
+	}
+	return v
 }
 
 // JSON is a helper function for creating JSON-encoded strings.

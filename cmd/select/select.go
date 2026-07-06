@@ -188,7 +188,7 @@ type Flags struct {
 	IgnoreGlacierWarnings bool
 
 	// CSV-specific.
-	Delimiter     string
+	Delimiter      string
 	FileHeaderInfo string
 
 	// JSON-specific.
@@ -284,11 +284,11 @@ func (o *Options) validate() error {
 //
 //  1. expandSource -> objch (channel of *storage.Object)
 //  2. parallel.NewWaiter + resultCh := make(chan json.RawMessage, 128)
-//  3. goroutine A drains waiter.Err() into a slice
+//  3. goroutine A drains waiter.Err() into a cliutil.ErrorCollector
 //  4. goroutine B drains resultCh into stdout, cancelling ctx on EPIPE
 //  5. for each object in objch: parallel.Run(prepareTask) where
 //     prepareTask calls storage.Select(ctx, url, query, resultCh)
-//  6. waiter.Wait(); close(resultCh); <-errDoneCh; <-writeDoneCh
+//  6. waiter.Wait(); close(resultCh); drainDone(); <-writeDoneCh
 func (o *Options) run(ctx context.Context) error {
 	store, err := cliutil.NewStorage(ctx, o.CommonFlags)
 	if err != nil {
@@ -326,27 +326,14 @@ func (o *Options) run(ctx context.Context) error {
 		return err
 	}
 
+	// goroutine A: the collector's drain consumes waiter.Err(). The
+	// collector serializes appends from the drain goroutine and the
+	// submission loop below, which used to race on a shared errs slice.
 	waiter := parallel.NewWaiter()
 	resultCh := make(chan json.RawMessage, 128)
-	errs := make([]error, 0)
-	errDoneCh := make(chan struct{})
 	writeDoneCh := make(chan struct{})
-
-	// goroutine A: drain waiter.Err() into errs.
-	go func() {
-		defer close(errDoneCh)
-		for err := range waiter.Err() {
-			if errorpkg.IsCancelation(err) {
-				continue
-			}
-			if errorpkg.IsWarning(err) {
-				log.Debug(log.DebugMessage{Operation: "select", Err: err.Error()})
-				continue
-			}
-			log.Error(log.ErrorMessage{Operation: "select", Err: err.Error()})
-			errs = append(errs, err)
-		}
-	}()
+	ec := cliutil.NewErrorCollector("select")
+	drainDone := ec.Drain(waiter)
 
 	// goroutine B: drain resultCh into stdout. On EPIPE (broken pipe —
 	// typically because the user piped the output to head and closed it)
@@ -375,11 +362,7 @@ func (o *Options) run(ctx context.Context) error {
 
 	for _, object := range objects {
 		if object.Err != nil {
-			if errorpkg.IsCancelation(object.Err) {
-				continue
-			}
-			log.Error(log.ErrorMessage{Operation: "select", Err: object.Err.Error()})
-			errs = append(errs, object.Err)
+			ec.Collect(object.Err)
 			continue
 		}
 		if object.Type.IsDir() {
@@ -395,9 +378,7 @@ func (o *Options) run(ctx context.Context) error {
 		// is set.
 		if isGlacierStorageClass(object.StorageClass) && !o.ForceGlacierTransfer {
 			if !o.IgnoreGlacierWarnings {
-				err := fmt.Errorf("object '%v' is on Glacier storage", object)
-				log.Error(log.ErrorMessage{Operation: "select", Err: err.Error()})
-				errs = append(errs, err)
+				ec.Collect(fmt.Errorf("object '%v' is on Glacier storage", object))
 			}
 			continue
 		}
@@ -417,10 +398,10 @@ func (o *Options) run(ctx context.Context) error {
 
 	waiter.Wait()
 	close(resultCh)
-	<-errDoneCh
+	drainDone()
 	<-writeDoneCh
 
-	return cliutil.AggregateErrors(errs)
+	return ec.Aggregate()
 }
 
 // prepareTask builds the per-object task that calls storage.Select. The

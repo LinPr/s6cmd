@@ -26,4 +26,3 @@ func IsLocalDir(path string) (bool, error) {
 	}
 	return info.IsDir(), nil
 }
-

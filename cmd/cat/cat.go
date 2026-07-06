@@ -23,10 +23,6 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// megabyte is the conversion factor from MiB to bytes used for --part-size,
-// which the user supplies in MiB but storage.Get expects in bytes.
-const megabyte = 1024 * 1024
-
 // NewCatCmd creates the `cat` command.
 func NewCatCmd() *cobra.Command {
 	o := newOptions()
@@ -113,10 +109,7 @@ func (o *Options) run(ctx context.Context, out io.Writer) error {
 		return err
 	}
 
-	partSize := int64(o.PartSizeMiB) * megabyte
-	if partSize <= 0 {
-		partSize = int64(cliutil.DefaultPartSizeMiB) * megabyte
-	}
+	partSize := cliutil.PartSizeBytesFromMiB(o.PartSizeMiB)
 	concurrency := o.Concurrency
 	if concurrency <= 0 {
 		concurrency = cliutil.DefaultCopyConcurrency

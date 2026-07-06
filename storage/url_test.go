@@ -232,9 +232,9 @@ func TestStorageURLIsBucket(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		input    string
-		want     bool
-		wantErr  bool
+		input   string
+		want    bool
+		wantErr bool
 	}{
 		{"s3://bucket", true, false},
 		{"s3://bucket/file", false, false},
@@ -331,12 +331,12 @@ func TestSetPrefixAndFilter(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name         string
-		path         string
-		wantPrefix   string
-		wantFilter   string
-		wantRegex    string
-		wantDelim    string
+		name       string
+		path       string
+		wantPrefix string
+		wantFilter string
+		wantRegex  string
+		wantDelim  string
 	}{
 		{
 			name:       "wildcard_log",
@@ -778,18 +778,46 @@ func TestHasGlobCharacter(t *testing.T) {
 }
 
 // TestStorageURLEscapedPath verifies that EscapedPath percent-encodes each
-// path element but keeps the slashes intact. url.QueryEscape encodes a
-// space as "+", which is the documented behaviour, so we expect "+" here.
+// path element but keeps the slashes intact. Spaces must become "%20" (not
+// "+", which S3 reads as a literal plus in a CopySource path), and a
+// VersionID must be appended as the "?versionId=" subresource.
 func TestStorageURLEscapedPath(t *testing.T) {
 	t.Parallel()
 
-	u, err := NewStorageURL("s3://bucket/a b/c d.txt")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	tests := []struct {
+		name  string
+		input string
+		opts  []Option
+		want  string
+	}{
+		{
+			name:  "spaces_are_percent_encoded",
+			input: "s3://bucket/a b/c d.txt",
+			want:  "bucket/a%20b/c%20d.txt",
+		},
+		{
+			name:  "plain_key_unchanged",
+			input: "s3://bucket/dir/file.txt",
+			want:  "bucket/dir/file.txt",
+		},
+		{
+			name:  "version_id_appended",
+			input: "s3://bucket/a b.txt",
+			opts:  []Option{WithVersion("ver 1")},
+			want:  "bucket/a%20b.txt?versionId=ver+1",
+		},
 	}
-	want := "bucket/a+b/c+d.txt"
-	if got := u.EscapedPath(); got != want {
-		t.Errorf("EscapedPath() = %q, want %q", got, want)
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			u, err := NewStorageURL(tc.input, tc.opts...)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := u.EscapedPath(); got != tc.want {
+				t.Errorf("EscapedPath() = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -808,5 +836,53 @@ func TestStorageURLMarshalJSON(t *testing.T) {
 	want := `"s3://bucket/key"`
 	if string(got) != want {
 		t.Errorf("MarshalJSON() = %s, want %s", got, want)
+	}
+}
+
+// TestEnsureLocalRelPath verifies the path-traversal guard applied when a
+// relative path derived from a remote object key is joined onto a local
+// destination directory: keys that would escape the destination (via "..",
+// absolute paths, or an empty relative path) are rejected, and the error
+// names the offending key.
+func TestEnsureLocalRelPath(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		key     string
+		rel     string
+		wantErr bool
+	}{
+		{"plain_file", "file.txt", "file.txt", false},
+		{"nested_path", "a/b/file.txt", "a/b/file.txt", false},
+		{"leading_dots_in_name", "..file", "..file", false},
+		{"trailing_dots_in_name", "file..", "file..", false},
+		{"parent_traversal", "../../.ssh/authorized_keys", "../../.ssh/authorized_keys", true},
+		{"embedded_traversal", "a/../../b", "a/../../b", true},
+		{"bare_dotdot", "..", "..", true},
+		{"absolute_path", "/etc/passwd", "/etc/passwd", true},
+		{"empty_rel", "prefix/", "", true},
+		// "." is considered local by filepath.IsLocal; joining it onto the
+		// destination yields the destination itself, which is not an escape
+		// (the subsequent write fails with an ordinary fs error instead).
+		{"dot", ".", ".", false},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := EnsureLocalRelPath(tc.key, tc.rel)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("EnsureLocalRelPath(%q, %q) = nil, want error", tc.key, tc.rel)
+				}
+				if !strings.Contains(err.Error(), tc.key) {
+					t.Errorf("error %q does not name the offending key %q", err, tc.key)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("EnsureLocalRelPath(%q, %q) = %v, want nil", tc.key, tc.rel, err)
+			}
+		})
 	}
 }

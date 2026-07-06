@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 
 	"github.com/LinPr/s6cmd/internal/errorpkg"
+	"github.com/LinPr/s6cmd/log"
 	"github.com/LinPr/s6cmd/storage"
 )
 
@@ -95,10 +96,22 @@ func (f *FileStore) expandGlob(ctx context.Context, src *storage.StorageURL, fol
 			}
 			fileURL.SetRelative(src)
 
+			// Skip symlinks up front when followSymlinks is false; without
+			// this, symlinked files matched by the glob would be followed
+			// (directories were already filtered inside walkDir).
+			if !ShouldProcessURL(fileURL, followSymlinks) {
+				continue
+			}
 			obj, err := f.Stat(ctx, fileURL)
 			if err != nil {
-				sendError(ctx, err, ch)
-				return
+				// A per-entry Stat failure (e.g. a dangling symlink, or a
+				// file removed between Glob and Stat) should not abort the
+				// whole listing; log it and move on.
+				log.Debug(log.DebugMessage{
+					Operation: "list",
+					Err:       fmt.Sprintf("stat %q: %v", filename, err),
+				})
+				continue
 			}
 			if !obj.Type.IsDir() {
 				sendObject(ctx, obj, ch)
@@ -158,13 +171,17 @@ func (f *FileStore) walkDir(ctx context.Context, src *storage.StorageURL, follow
 }
 
 // Copy copies src.Absolute() to dst.Absolute(), creating parent directories
-// as needed. The Metadata argument is ignored on the local backend.
+// as needed. The Metadata argument is ignored on the local backend. The data
+// is written to a temporary file in the destination directory and renamed
+// into place only after a successful write+close, so a failed copy (e.g.
+// ENOSPC surfacing at Close) never truncates or replaces an existing file.
 func (f *FileStore) Copy(ctx context.Context, src, dst *storage.StorageURL, _ storage.Metadata) error {
 	_ = ctx
 	if f.dryRun {
 		return nil
 	}
-	if err := os.MkdirAll(dst.Dir(), os.ModePerm); err != nil {
+	dstDir := dst.Dir()
+	if err := os.MkdirAll(dstDir, 0o755); err != nil {
 		return err
 	}
 	in, err := os.Open(src.Absolute())
@@ -172,13 +189,23 @@ func (f *FileStore) Copy(ctx context.Context, src, dst *storage.StorageURL, _ st
 		return err
 	}
 	defer in.Close()
-	out, err := os.Create(dst.Absolute())
+	out, err := f.CreateTemp(dstDir, "s6cmd-")
 	if err != nil {
 		return err
 	}
-	defer out.Close()
+	tempPath := out.Name()
 	_, err = io.Copy(out, in)
-	return err
+	if closeErr := out.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = os.Rename(tempPath, dst.Absolute())
+	}
+	if err != nil {
+		_ = os.Remove(tempPath)
+		return err
+	}
+	return nil
 }
 
 // Delete removes the file at url.Absolute().
@@ -214,7 +241,7 @@ func (f *FileStore) MkdirAll(path string) error {
 	if f.dryRun {
 		return nil
 	}
-	return os.MkdirAll(path, os.ModePerm)
+	return os.MkdirAll(path, 0o755)
 }
 
 // Create creates or truncates the named file.

@@ -17,8 +17,12 @@ func NewStorage(ctx context.Context, flags CommonFlags) (*storage.Storage, error
 	if err != nil {
 		return nil, err
 	}
-	local := fsstore.NewFileStore(ctx, fsstore.LocalOption{DryRun: false})
-	return storage.NewStorage(remote, local), nil
+	local := fsstore.NewFileStore(ctx, fsstore.LocalOption{DryRun: flags.DryRun})
+	st := storage.NewStorage(remote, local)
+	// The aggregate's own dry-run flag guards the path-based convenience
+	// wrappers (DownloadFile) that bypass the backends' no-ops.
+	st.SetDryRun(flags.DryRun)
+	return st, nil
 }
 
 // NewS3Client returns the bare S3Store. It is kept for cmd/ls/mb/stat which
@@ -29,11 +33,15 @@ func NewS3Client(ctx context.Context, flags CommonFlags) (*s3store.S3Store, erro
 }
 
 // s3OptFromFlags translates the shared CommonFlags into an S3Option.
-// UsePathStyle is the single addressing knob: true forces path-style
-// (MinIO/OSS/COS/GCS), false (default) uses virtual-host (AWS S3).
+// UsePathStyle/PathStyleExplicit drive the addressing policy: an explicit
+// --path-style (true or false) wins, an unset flag defaults to path-style
+// when a custom endpoint is configured (MinIO/OSS/COS/GCS) and to the AWS
+// virtual-host default otherwise.
 func s3OptFromFlags(flags CommonFlags) s3store.S3Option {
 	return s3store.S3Option{
 		UsePathStyle:           flags.PathStyle,
+		PathStyleExplicit:      flags.PathStyleSet,
+		DryRun:                 flags.DryRun,
 		Region:                 flags.Region,
 		Profile:                flags.Profile,
 		Endpoint:               flags.EndpointURL,
@@ -42,5 +50,6 @@ func s3OptFromFlags(flags CommonFlags) s3store.S3Option {
 		NoSuchUploadRetryCount: flags.NoSuchUploadRetryCount,
 		CredentialFile:         flags.CredentialsFile,
 		NoSignRequest:          flags.NoSignRequest,
+		UseListObjectsV1:       flags.UseListObjectsV1,
 	}
 }

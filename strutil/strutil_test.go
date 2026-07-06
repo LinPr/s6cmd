@@ -89,9 +89,8 @@ func Test_WildCardToRegexp(t *testing.T) {
 
 // TestHumanizeBytes verifies the SI-style humanizer for byte counts.
 //
-// Note: the implementation uses ">" (strict) when picking the unit, so a
-// value exactly equal to a unit boundary (1024, 1<<20, ...) stays in the
-// smaller unit.
+// A value exactly equal to a unit boundary (1024, 1<<20, ...) renders in
+// the larger unit ("1.0K", not "1024").
 func TestHumanizeBytes(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -102,10 +101,11 @@ func TestHumanizeBytes(t *testing.T) {
 		{"zero", 0, "0"},
 		{"one", 1, "1"},
 		{"bytes_under_kib", 512, "512"},
-		{"one_kib_strict", 1 << 10, "1024"},
-		{"one_mib_strict", 1 << 20, "1024.0K"},
-		{"one_gib_strict", 1 << 30, "1024.0M"},
-		{"one_tib_strict", 1 << 40, "1024.0G"},
+		{"just_under_1k", 1023, "1023"},
+		{"one_kib_boundary", 1 << 10, "1.0K"},
+		{"one_mib_boundary", 1 << 20, "1.0M"},
+		{"one_gib_boundary", 1 << 30, "1.0G"},
+		{"one_tib_boundary", 1 << 40, "1.0T"},
 		{"just_over_1k", 1025, "1.0K"},
 		{"fractional_kib", 1536, "1.5K"},
 		{"fractional_mib", 5 * (1 << 20), "5.0M"},
@@ -176,5 +176,27 @@ func TestJSON(t *testing.T) {
 	// nil marshals to "null".
 	if got := JSON(nil); got != "null" {
 		t.Errorf("JSON(nil) = %q, want %q", got, "null")
+	}
+}
+
+func TestTrimQuotes(t *testing.T) {
+	testCases := []struct {
+		in   string
+		want string
+	}{
+		{`"abc"`, "abc"},
+		{`'abc'`, "abc"},
+		{`""abc""`, "abc"},
+		{`abc`, "abc"},
+		{`"abc`, `"abc`},   // unbalanced quotes are kept
+		{`"abc'`, `"abc'`}, // mismatched pair is kept
+		{`""`, ""},
+		{`"`, `"`},
+		{"", ""},
+	}
+	for _, tc := range testCases {
+		if got := TrimQuotes(tc.in); got != tc.want {
+			t.Errorf("TrimQuotes(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }

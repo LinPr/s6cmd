@@ -7,7 +7,7 @@ import (
 	"errors"
 	"io"
 	"os"
-	"strings"
+	"path/filepath"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
@@ -185,6 +185,12 @@ type Object struct {
 	// the VersionID field exist only for JSON Marshall, it must not be used for
 	// any other purpose. URL.VersionID must be used instead.
 	VersionID string `json:"version_id,omitempty"`
+
+	// IsDeleteMarker reports that this entry is a versioned-bucket delete
+	// marker rather than an object version. It is set by version listings so
+	// callers (e.g. ls rendering, rm --all-versions) can tell markers apart
+	// from real versions.
+	IsDeleteMarker bool `json:"is_delete_marker,omitempty"`
 }
 
 // String returns the string representation of Object.
@@ -249,6 +255,17 @@ type Storage struct {
 	// populated by NewStorage so the forwarding methods can call S3-specific
 	// operations without a per-call type assertion.
 	remoteS3 S3Extension
+
+	// dryRun marks the aggregate as dry-run. The backends already no-op
+	// their own mutations; this flag additionally guards the convenience
+	// wrappers below (DownloadFile) that touch the local filesystem
+	// directly and would otherwise create/truncate files during a dry run.
+	dryRun bool
+}
+
+// SetDryRun marks the aggregate as dry-run. See the dryRun field comment.
+func (s *Storage) SetDryRun(v bool) {
+	s.dryRun = v
 }
 
 // NewStorage wraps the given remote and local Storage implementations into a
@@ -427,7 +444,18 @@ func (s *Storage) Select(ctx context.Context, url *StorageURL, query *SelectQuer
 // methods above.
 
 // DownloadFile downloads an S3 object to a local path (or "-" for stdout).
-func (s *Storage) DownloadFile(ctx context.Context, bucketName, objectKey, localFile string) error {
+// The object is streamed into a temporary file in the destination directory
+// and renamed into place only after a fully successful transfer, so a
+// mid-transfer failure never truncates or replaces an existing file.
+// concurrency and partSize tune the multipart download; values <= 0 fall
+// back to the defaults (manager.DefaultDownloadConcurrency, 10 MiB).
+func (s *Storage) DownloadFile(ctx context.Context, bucketName, objectKey, localFile string, concurrency int, partSize int64) error {
+	// Dry-run: the remote Get would be a no-op anyway, but the temp-file
+	// + rename dance below would still create (or truncate) localFile, so
+	// bail out before touching the filesystem.
+	if s.dryRun {
+		return nil
+	}
 	url, err := NewStorageURL("s3://" + bucketName + "/" + objectKey)
 	if err != nil {
 		return err
@@ -445,21 +473,45 @@ func (s *Storage) DownloadFile(ctx context.Context, bucketName, objectKey, local
 		_, err = io.Copy(os.Stdout, resp)
 		return err
 	}
-	if err := os.MkdirAll(filePathDir(localFile), 0o755); err != nil {
+	dir := filepath.Dir(localFile)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	f, err := os.Create(localFile)
+	f, err := os.CreateTemp(dir, "s6cmd-")
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	const defaultPartSize = 10 * 1024 * 1024
-	_, err = ext.Get(ctx, url, f, manager.DefaultDownloadConcurrency, defaultPartSize)
-	return err
+	tempPath := f.Name()
+	// os.CreateTemp creates the file with 0600; widen to the usual 0644
+	// (still subject to umask semantics via Chmod on most filesystems).
+	if err := f.Chmod(0o644); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tempPath)
+		return err
+	}
+	if concurrency <= 0 {
+		concurrency = manager.DefaultDownloadConcurrency
+	}
+	if partSize <= 0 {
+		partSize = 10 * 1024 * 1024
+	}
+	_, err = ext.Get(ctx, url, f, concurrency, partSize)
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = os.Rename(tempPath, localFile)
+	}
+	if err != nil {
+		_ = os.Remove(tempPath)
+		return err
+	}
+	return nil
 }
 
-// UploadFile uploads a local file to S3.
-func (s *Storage) UploadFile(ctx context.Context, fileName, bucketName, objectKey string) (*manager.UploadOutput, error) {
+// UploadFile uploads a local file to S3. concurrency and partSize tune the
+// multipart upload; values <= 0 fall back to the manager defaults.
+func (s *Storage) UploadFile(ctx context.Context, fileName, bucketName, objectKey string, concurrency int, partSize int64) (*manager.UploadOutput, error) {
 	f, err := os.Open(fileName)
 	if err != nil {
 		return nil, err
@@ -473,7 +525,13 @@ func (s *Storage) UploadFile(ctx context.Context, fileName, bucketName, objectKe
 	if err != nil {
 		return nil, err
 	}
-	if err := ext.Put(ctx, f, url, Metadata{}, manager.DefaultUploadConcurrency, manager.DefaultUploadPartSize); err != nil {
+	if concurrency <= 0 {
+		concurrency = manager.DefaultUploadConcurrency
+	}
+	if partSize <= 0 {
+		partSize = manager.DefaultUploadPartSize
+	}
+	if err := ext.Put(ctx, f, url, Metadata{}, concurrency, partSize); err != nil {
 		return nil, err
 	}
 	return &manager.UploadOutput{Location: url.String()}, nil
@@ -550,8 +608,11 @@ func (s *Storage) GetBucketVersioning(ctx context.Context, bucket string) (strin
 	return ext.GetBucketVersioning(ctx, bucket)
 }
 
-// UploadFromStdin uploads os.Stdin to the given bucket/key.
-func (s *Storage) UploadFromStdin(ctx context.Context, bucketName, objectKey string) (*manager.UploadOutput, error) {
+// UploadFromStdin uploads os.Stdin to the given bucket/key. concurrency and
+// partSize tune the multipart upload; values <= 0 fall back to the manager
+// defaults. Note the part size also bounds how much of the (non-seekable)
+// stream is buffered in memory per in-flight part.
+func (s *Storage) UploadFromStdin(ctx context.Context, bucketName, objectKey string, concurrency int, partSize int64) (*manager.UploadOutput, error) {
 	url, err := NewStorageURL("s3://" + bucketName + "/" + objectKey)
 	if err != nil {
 		return nil, err
@@ -560,8 +621,14 @@ func (s *Storage) UploadFromStdin(ctx context.Context, bucketName, objectKey str
 	if err != nil {
 		return nil, err
 	}
+	if concurrency <= 0 {
+		concurrency = manager.DefaultUploadConcurrency
+	}
+	if partSize <= 0 {
+		partSize = manager.DefaultUploadPartSize
+	}
 	stdinReader := &stdin{file: os.Stdin}
-	if err := ext.Put(ctx, stdinReader, url, Metadata{}, manager.DefaultUploadConcurrency, manager.DefaultUploadPartSize); err != nil {
+	if err := ext.Put(ctx, stdinReader, url, Metadata{}, concurrency, partSize); err != nil {
 		return nil, err
 	}
 	return &manager.UploadOutput{Location: url.String()}, nil
@@ -574,18 +641,3 @@ type stdin struct {
 }
 
 func (s *stdin) Read(p []byte) (n int, err error) { return s.file.Read(p) }
-
-// filePathDir is a tiny helper to avoid importing path/filepath here.
-func filePathDir(p string) string {
-	if p == "" {
-		return ""
-	}
-	idx := strings.LastIndexByte(p, '/')
-	if idx < 0 {
-		return "."
-	}
-	if idx == 0 {
-		return "/"
-	}
-	return p[:idx]
-}

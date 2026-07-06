@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/LinPr/s6cmd/internal/parallel"
 )
@@ -200,4 +201,52 @@ func TestNew_NegativeDefaultsToMinWorkers(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestWaiter_DrainBeforeWaitContract documents the Waiter's core contract:
+// the error channel is unbuffered, so a task that reports an error blocks
+// until a reader receives it, and Wait cannot return before every reported
+// error has been drained. Callers therefore MUST drain Err() concurrently
+// with (or before) Wait.
+func TestWaiter_DrainBeforeWaitContract(t *testing.T) {
+	t.Parallel()
+	m := parallel.New(4)
+	w := parallel.NewWaiter()
+
+	boom := errors.New("boom")
+	m.Run(func() error { return boom }, w)
+
+	// Without a drain, Wait must not return: the task goroutine is still
+	// blocked sending on the unbuffered error channel.
+	waitDone := make(chan struct{})
+	go func() {
+		w.Wait()
+		close(waitDone)
+	}()
+	select {
+	case <-waitDone:
+		t.Fatal("Wait returned before the error was drained; the drain-before-Wait contract is broken")
+	case <-time.After(50 * time.Millisecond):
+		// Expected: Wait is blocked on the undelivered error.
+	}
+
+	// Draining unblocks the task and lets Wait finish.
+	var got []error
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		for err := range w.Err() {
+			got = append(got, err)
+		}
+	}()
+	select {
+	case <-waitDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Wait did not return after the error channel was drained")
+	}
+	<-drained
+	if len(got) != 1 || !errors.Is(got[0], boom) {
+		t.Errorf("drained errors = %v, want [boom]", got)
+	}
+	m.Close()
 }

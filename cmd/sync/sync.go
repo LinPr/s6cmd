@@ -10,14 +10,16 @@
 // them in memory (no goroutine needed for the compare), and only then
 // submitting cp/rm tasks to the parallel.Manager.
 //
-// The single-file --delete case (src is one object, dst is one object)
-// is now handled correctly: when src and dst differ, the dst is queued
-// for deletion; previously the single-file path was short-circuited
-// because the delete-extra guard required srcIsPrefix.
+// The plan is keyed by full destination path: every source object is
+// resolved to the exact destination URL it will be written to, paired with
+// the existing destination object under that key (if any), and the delete
+// set for --delete is (destination keys) minus (keys written this run).
+// The previous merge-compare matched single-object syncs by Base() names,
+// so `sync --delete newsrc.txt s3://bucket/target.txt` classified the
+// destination it had just written as "only-destination" and deleted it.
 package sync
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -49,17 +51,12 @@ func NewSyncCmd() *cobra.Command {
 			if err := o.validate(); err != nil {
 				return err
 			}
-			ctx := cmd.Context()
-			if o.DryRun {
-				fmt.Fprintf(cmd.OutOrStdout(), "DRYRUN: sync %s %s\n", o.Source, o.Destination)
-				return nil
-			}
-			return o.run(ctx, cmd.InOrStdin(), cmd.ErrOrStderr())
+			return o.run(cmd.Context(), cmd.InOrStdin(), cmd.ErrOrStderr())
 		},
 	}
 
 	// sync-specific flags.
-	cmd.Flags().BoolVarP(&o.DryRun, "dryRun", "n", false, "show what would be transferred")
+	cmd.Flags().BoolVarP(&o.DryRun, "dry-run", "n", false, "plan the sync and print one line per operation without transferring or deleting anything")
 	cmd.Flags().BoolVarP(&o.Delete, "delete", "D", false, "delete objects in destination that are not in source")
 	cmd.Flags().BoolVarP(&o.Yes, "yes", "y", false, "skip risk prompt for delete")
 	cmd.Flags().BoolVar(&o.SizeOnly, "size-only", false, "make size of object the only comparison criterion")
@@ -103,6 +100,10 @@ func (o *Options) complete(cmd *cobra.Command, args []string) error {
 		o.Destination = args[1]
 	}
 	o.CommonFlags = cliutil.LoadParentFlags(cmd)
+	// Propagate --dry-run into the store constructors so every mutating
+	// storage call becomes a no-op while the plan/compare phases run for
+	// real.
+	o.CommonFlags.DryRun = o.DryRun
 	return nil
 }
 
@@ -117,9 +118,16 @@ func (o *Options) validate() error {
 }
 
 func (o *Options) run(ctx context.Context, stdin io.Reader, stderr io.Writer) error {
-	if o.Delete && !o.Yes {
-		if !confirmDelete(stdin, stderr, o.Source, o.Destination) {
-			return nil
+	// --delete destroys destination objects, so it needs an explicit
+	// confirmation: --yes, or an interactive y at the prompt. A dry run
+	// deletes nothing and skips the prompt. Non-interactive runs without
+	// --yes fail loudly instead of silently skipping the deletes (the
+	// previous behaviour, which also ate a line of piped stdin).
+	if o.Delete && !o.Yes && !o.DryRun {
+		fmt.Fprintf(stderr, "WARNING: this will delete objects in destination that are not in source.\n")
+		fmt.Fprintf(stderr, "  source: %s\n  destination: %s\n", o.Source, o.Destination)
+		if err := cliutil.Confirm(ctx, stdin, stderr, "Continue?"); err != nil {
+			return fmt.Errorf("sync --delete: %w", err)
 		}
 	}
 
@@ -152,16 +160,6 @@ func (o *Options) run(ctx context.Context, stdin io.Reader, stderr io.Writer) er
 	}
 }
 
-func confirmDelete(in io.Reader, out io.Writer, source, destination string) bool {
-	fmt.Fprintf(out, "WARNING: this will delete objects in destination that are not in source.\n")
-	fmt.Fprintf(out, "  source: %s\n  destination: %s\n", source, destination)
-	fmt.Fprint(out, "Continue? [y/N]: ")
-	reader := bufio.NewReader(in)
-	line, _ := reader.ReadString('\n')
-	line = strings.TrimSpace(line)
-	return strings.EqualFold(line, "y") || strings.EqualFold(line, "yes")
-}
-
 // syncPair captures the per-direction dispatch for sync. Each variant
 // (S3ToS3/S3ToLocal/LocalToS3/LocalToLocal) populates the source and
 // destination object slices via listObjects, then calls planAndRun with
@@ -185,7 +183,15 @@ type syncPair struct {
 // would get relative="src/" and the merge-compare would never pair it
 // with the corresponding source object, causing every file to be
 // re-uploaded even when --size-only should skip it.
-func (o *Options) listObjects(ctx context.Context, store *storage.Storage, src *storage.StorageURL, followSymlinks bool) ([]*storage.Object, error) {
+//
+// isDestination distinguishes destination listings from source listings:
+// a destination that does not exist yet is an empty listing, not a
+// failure — every first-time sync writes into a missing destination
+// prefix/directory, and the not-found sentinels are warnings
+// (errorpkg.IsWarning), mirroring ErrorCollector.Collect. Source-side
+// not-found errors keep their error semantics: syncing from a nonexistent
+// source is a real failure.
+func (o *Options) listObjects(ctx context.Context, store *storage.Storage, src *storage.StorageURL, followSymlinks, isDestination bool) ([]*storage.Object, error) {
 	listSrc := src
 	listPrefix := ""
 	if src.IsRemote() && (src.IsBucket() || src.IsPrefix()) {
@@ -198,6 +204,10 @@ func (o *Options) listObjects(ctx context.Context, store *storage.Storage, src *
 	for obj := range store.List(ctx, listSrc, followSymlinks) {
 		if obj.Err != nil {
 			if errorpkg.IsCancelation(obj.Err) {
+				continue
+			}
+			if isDestination && errorpkg.IsWarning(obj.Err) {
+				log.Debug(log.DebugMessage{Operation: "sync", Err: obj.Err.Error()})
 				continue
 			}
 			if o.ExitOnError {
@@ -230,14 +240,16 @@ func (o *Options) listObjects(ctx context.Context, store *storage.Storage, src *
 //
 //  1. Collect source and destination objects into slices (already done
 //     by the caller; we receive them).
-//  2. Merge-compare the two sorted slices by relative path, producing
-//     three buckets: only-source, only-destination, and common pairs.
-//  3. Submit cp tasks for only-source + (common pairs where the strategy
-//     says they differ) on the parallel.Manager.
-//  4. When --delete is set, submit rm tasks for only-destination.
+//  2. Resolve every source object to its exact destination URL and pair
+//     it with the existing destination object under that key, if any
+//     (buildSyncPlan).
+//  3. Submit cp tasks for every pair the strategy says should be copied
+//     on the parallel.Manager.
+//  4. When --delete is set, submit rm tasks for the extra destination
+//     objects: (destination keys) minus (keys written this run).
 //
-// All task-submission happens on the main goroutine so the `expected`
-// set (used by the --delete path) is never written from a worker.
+// All task-submission happens on the main goroutine so the plan maps are
+// never written from a worker.
 func (o *Options) planAndRun(
 	ctx context.Context,
 	store *storage.Storage,
@@ -255,131 +267,150 @@ func (o *Options) planAndRun(
 		return err
 	}
 
+	// A non-batch sync onto a local path needs to know whether the path is
+	// a directory (copy under it) or a file (copy onto it exactly).
+	dstIsDir := false
+	if !pair.dst.IsRemote() {
+		dstIsDir, err = cliutil.IsLocalDir(pair.dst.Absolute())
+		if err != nil {
+			return err
+		}
+	}
+
 	pb := progressbar.New(false)
 	pb.Start()
 	defer pb.Finish()
 
+	// The collector serializes appends from the drain goroutine and the
+	// submission loop below. The drain never stops early: the Waiter's
+	// error channel is unbuffered, so the old break-on-first-error drain
+	// deadlocked waiter.Wait() as soon as a second task errored. Instead,
+	// --exit-on-error stops FURTHER submissions via ec.HasError() checks
+	// in the submission loops; tasks already in flight run to completion
+	// and their errors are still drained.
 	waiter := parallel.NewWaiter()
-	errs := make([]error, 0)
-	errDoneCh := make(chan struct{})
-	go func() {
-		defer close(errDoneCh)
-		for err := range waiter.Err() {
-			if errorpkg.IsCancelation(err) {
-				continue
-			}
-			if errorpkg.IsWarning(err) {
-				log.Debug(log.DebugMessage{Operation: "sync", Err: err.Error()})
-				continue
-			}
-			log.Error(log.ErrorMessage{Operation: "sync", Err: err.Error()})
-			errs = append(errs, err)
-			if o.ExitOnError {
-				// Cancel the context so in-flight tasks stop. We do not
-				// have a cancel handy here; the caller's ctx is the
-				// surface we have, and it is the root command ctx. The
-				// ExitOnError path is best-effort: once the waiter drains
-				// its current queue it will stop because no more tasks
-				// are submitted below.
-				break
-			}
-		}
-	}()
+	ec := cliutil.NewErrorCollector("sync")
+	drainDone := ec.Drain(waiter)
 
 	strategy := newStrategy(o.SizeOnly)
 
-	// Merge-compare the two sorted slices. Both i and j advance in
-	// lockstep; the smaller relative path wins, equality produces a
-	// common pair.
-	i, j := 0, 0
-	for i < len(srcObjects) || j < len(dstObjects) {
-		var srcObj, dstObj *storage.Object
-		switch {
-		case i < len(srcObjects) && j < len(dstObjects):
-			srcName := srcObjects[i].StorageURL.Relative()
-			dstName := dstObjects[j].StorageURL.Relative()
-			if !isBatch {
-				srcName = srcObjects[i].StorageURL.Base()
-				dstName = dstObjects[j].StorageURL.Base()
-			}
-			if srcName < dstName {
-				srcObj = srcObjects[i]
-				i++
-			} else if srcName == dstName {
-				// Common: ask the strategy whether to copy.
-				if err := strategy.ShouldSync(srcObjects[i], dstObjects[j]); err != nil {
-					if errorpkg.IsWarning(err) {
-						log.Debug(log.DebugMessage{Operation: "sync", Err: err.Error()})
-					} else {
-						errs = append(errs, err)
-					}
-				} else {
-					srcObj = srcObjects[i]
-					dstObj = dstObjects[j]
-				}
-				i++
-				j++
-				if srcObj == nil {
-					continue
-				}
-			} else {
-				// only destination: queue for delete if --delete.
-				if o.Delete {
-					o.queueDelete(ctx, store, waiter, dstObjects[j].StorageURL, &errs)
-				}
-				j++
-				continue
-			}
-		case i < len(srcObjects):
-			srcObj = srcObjects[i]
-			i++
-		case j < len(dstObjects):
-			if o.Delete {
-				o.queueDelete(ctx, store, waiter, dstObjects[j].StorageURL, &errs)
-			}
-			j++
-			continue
-		}
+	items, extras, planErrs := buildSyncPlan(srcObjects, dstObjects, pair.dst, isBatch, dstIsDir)
+	for _, err := range planErrs {
+		ec.Collect(err)
+	}
 
-		if srcObj == nil {
-			continue
+	for _, item := range items {
+		if o.ExitOnError && ec.HasError() {
+			// Stop scheduling new work after the first failure; the
+			// drain goroutine keeps consuming errors from in-flight
+			// tasks so waiter.Wait() below cannot deadlock.
+			break
 		}
 		// Apply exclude/include on the source name. The destination name
 		// is derived from the source name so it does not need separate
-		// filtering.
-		name := srcObj.StorageURL.Relative()
+		// filtering. Excluded sources still keep their destination key in
+		// the plan's written set, so --delete never removes the untouched
+		// counterpart of an excluded source.
+		name := item.srcObj.StorageURL.Relative()
 		if name == "" {
-			name = srcObj.StorageURL.Absolute()
+			name = item.srcObj.StorageURL.Absolute()
 		}
 		if cliutil.IsObjectExcluded(name, excludePatterns, includePatterns) {
 			continue
 		}
+		if item.dstObj != nil {
+			// The destination key already exists: ask the strategy
+			// whether to copy over it.
+			if err := strategy.ShouldSync(item.srcObj, item.dstObj); err != nil {
+				ec.Collect(err)
+				continue
+			}
+		}
 
-		dstURL := generateDestinationURL(srcObj.StorageURL, pair.dst, isBatch)
-		// When the strategy produced a common pair, dstObj is non-nil and
-		// the destination URL should match the existing destination (so
-		// server-side copy replaces the same key). generateDestinationURL
-		// already does this for prefix destinations.
-		_ = dstObj
-
-		pb.AddTotalBytes(srcObj.Size)
+		pb.AddTotalBytes(item.srcObj.Size)
 		pb.IncrementTotalObjects()
 
-		parallel.Run(buildTask(srcObj.StorageURL, dstURL), waiter)
+		parallel.Run(buildTask(item.srcObj.StorageURL, item.dstURL), waiter)
+	}
+
+	// The delete set is keyed by full destination path — never Base()
+	// names — so --delete can never enqueue the destination key of an
+	// in-flight copy scheduled above.
+	if o.Delete {
+		for _, extra := range extras {
+			if o.ExitOnError && ec.HasError() {
+				break
+			}
+			o.queueDelete(ctx, store, waiter, extra.StorageURL)
+		}
 	}
 
 	waiter.Wait()
-	<-errDoneCh
-	return cliutil.AggregateErrors(errs)
+	drainDone()
+	return ec.Aggregate()
+}
+
+// syncPlanItem pairs a source object with its resolved destination URL and
+// the existing destination object under that key (nil when the key does
+// not exist yet).
+type syncPlanItem struct {
+	srcObj *storage.Object
+	dstObj *storage.Object
+	dstURL *storage.StorageURL
+}
+
+// syncPlanKey canonicalizes a URL for plan matching. Remote URLs use the
+// absolute s3://bucket/key form; local URLs are path.Clean'ed so a walked
+// path and a Join'ed path for the same file always produce the same key.
+func syncPlanKey(u *storage.StorageURL) string {
+	if u.IsRemote() {
+		return u.Absolute()
+	}
+	return path.Clean(u.Absolute())
+}
+
+// buildSyncPlan resolves every source object to the exact destination URL
+// it will be written to, pairs it with the existing destination object
+// under the same key (if any), and computes the extra destination objects:
+// (destination keys) minus (keys written this run). Matching is by full
+// destination key — never Base() names — so a single-object sync to a
+// destination with a different basename can never classify its own
+// destination as extra (which previously made --delete remove the object
+// the copy had just written).
+func buildSyncPlan(srcObjects, dstObjects []*storage.Object, dst *storage.StorageURL, isBatch, dstIsDir bool) (items []syncPlanItem, extras []*storage.Object, errs []error) {
+	existing := make(map[string]*storage.Object, len(dstObjects))
+	for _, dstObj := range dstObjects {
+		existing[syncPlanKey(dstObj.StorageURL)] = dstObj
+	}
+
+	written := make(map[string]struct{}, len(srcObjects))
+	for _, srcObj := range srcObjects {
+		dstURL, err := generateDestinationURL(srcObj.StorageURL, dst, isBatch, dstIsDir)
+		if err != nil {
+			errs = append(errs, &errorpkg.Error{Op: "sync", Src: srcObj.StorageURL.String(), Err: err})
+			continue
+		}
+		key := syncPlanKey(dstURL)
+		written[key] = struct{}{}
+		items = append(items, syncPlanItem{
+			srcObj: srcObj,
+			dstObj: existing[key],
+			dstURL: dstURL,
+		})
+	}
+
+	for _, dstObj := range dstObjects {
+		if _, ok := written[syncPlanKey(dstObj.StorageURL)]; !ok {
+			extras = append(extras, dstObj)
+		}
+	}
+	return items, extras, errs
 }
 
 // queueDelete submits a MultiDelete-friendly delete for a single URL. It
 // does not call MultiDelete (which expects a channel); instead it uses
 // the per-URL Delete on the store. The waiter aggregates the error.
-//
-// The errs slice is shared with the task-submission loop; we append to it
-// under the same goroutine (the main one) so there is no race.
-func (o *Options) queueDelete(ctx context.Context, store *storage.Storage, waiter *parallel.Waiter, url *storage.StorageURL, errs *[]error) {
+func (o *Options) queueDelete(ctx context.Context, store *storage.Storage, waiter *parallel.Waiter, url *storage.StorageURL) {
 	parallel.Run(func() error {
 		if err := store.Delete(ctx, url); err != nil {
 			return &errorpkg.Error{Op: "sync", Dst: url.String(), Err: err}
@@ -392,19 +423,35 @@ func (o *Options) queueDelete(ctx context.Context, store *storage.Storage, waite
 // generateDestinationURL resolves the destination URL: for batch sources
 // the destination key is the source's relative path under the destination
 // prefix; for single-file sources it is the source's base name joined
-// to the destination (or the destination itself when it is a full key).
-func generateDestinationURL(srcURL, dstURL *storage.StorageURL, isBatch bool) *storage.StorageURL {
+// to the destination when the destination is a prefix/bucket/directory,
+// or the destination itself when it is a full key or a local file path.
+// When a remote source is joined onto a local destination the relative
+// path is validated so a malicious object key (e.g. "../../x") cannot
+// escape the destination directory.
+func generateDestinationURL(srcURL, dstURL *storage.StorageURL, isBatch, dstIsDir bool) (*storage.StorageURL, error) {
 	objname := srcURL.Base()
 	if isBatch {
 		objname = srcURL.Relative()
 	}
 	if dstURL.IsRemote() {
 		if dstURL.IsPrefix() || dstURL.IsBucket() {
-			return dstURL.Join(objname)
+			return dstURL.Join(objname), nil
 		}
-		return dstURL.Clone()
+		return dstURL.Clone(), nil
 	}
-	return dstURL.Join(objname)
+	if !isBatch && !dstIsDir {
+		// Single-object sync onto an explicit local file path: the
+		// destination is the file itself, not <dst>/<basename>. Joining
+		// the basename would both write to the wrong path and let
+		// --delete classify the real destination as extra.
+		return dstURL.Clone(), nil
+	}
+	if srcURL.IsRemote() {
+		if err := storage.EnsureLocalRelPath(srcURL.Path, objname); err != nil {
+			return nil, err
+		}
+	}
+	return dstURL.Join(objname), nil
 }
 
 // --- S3 -> S3 ---
@@ -415,11 +462,11 @@ func (o *Options) syncS3ToS3(ctx context.Context, store *storage.Storage, src, d
 		return fmt.Errorf("destination must be a prefix when source is a prefix")
 	}
 
-	srcObjects, err := o.listObjects(ctx, store, src, false)
+	srcObjects, err := o.listObjects(ctx, store, src, false, false)
 	if err != nil {
 		return err
 	}
-	dstObjects, err := o.listObjects(ctx, store, dstForListing(dst), false)
+	dstObjects, err := o.listDestObjects(ctx, store, dst, false)
 	if err != nil {
 		return err
 	}
@@ -450,18 +497,18 @@ func (o *Options) syncS3ToLocal(ctx context.Context, store *storage.Storage, src
 		}
 	}
 
-	srcObjects, err := o.listObjects(ctx, store, src, false)
+	srcObjects, err := o.listObjects(ctx, store, src, false, false)
 	if err != nil {
 		return err
 	}
 	// The local "list" walks the destination directory.
-	dstObjects, err := o.listObjects(ctx, store, dst, !o.Shared.NoFollowSymlinks)
+	dstObjects, err := o.listDestObjects(ctx, store, dst, !o.Shared.NoFollowSymlinks)
 	if err != nil {
 		return err
 	}
 	return o.planAndRun(ctx, store, syncPair{src: src, dst: dst}, srcObjects, dstObjects, srcIsPrefix, func(srcURL, dstURL *storage.StorageURL) parallel.Task {
 		return func() error {
-			if err := store.DownloadFile(ctx, srcURL.Bucket, srcURL.Path, dstURL.Absolute()); err != nil {
+			if err := store.DownloadFile(ctx, srcURL.Bucket, srcURL.Path, dstURL.Absolute(), o.Shared.Concurrency, o.Shared.PartSizeBytes()); err != nil {
 				return &errorpkg.Error{Op: "cp", Src: srcURL.String(), Dst: dstURL.Absolute(), Err: err}
 			}
 			log.Info(log.InfoMessage{Operation: "cp", Source: srcURL.String(), Destination: dstURL.Absolute()})
@@ -481,17 +528,17 @@ func (o *Options) syncLocalToS3(ctx context.Context, store *storage.Storage, src
 		return fmt.Errorf("destination must be a prefix when source is a directory")
 	}
 
-	srcObjects, err := o.listObjects(ctx, store, src, !o.Shared.NoFollowSymlinks)
+	srcObjects, err := o.listObjects(ctx, store, src, !o.Shared.NoFollowSymlinks, false)
 	if err != nil {
 		return err
 	}
-	dstObjects, err := o.listObjects(ctx, store, dstForListing(dst), false)
+	dstObjects, err := o.listDestObjects(ctx, store, dst, false)
 	if err != nil {
 		return err
 	}
 	return o.planAndRun(ctx, store, syncPair{src: src, dst: dst}, srcObjects, dstObjects, srcIsDir, func(srcURL, dstURL *storage.StorageURL) parallel.Task {
 		return func() error {
-			_, err := store.UploadFile(ctx, srcURL.Absolute(), dstURL.Bucket, dstURL.Path)
+			_, err := store.UploadFile(ctx, srcURL.Absolute(), dstURL.Bucket, dstURL.Path, o.Shared.Concurrency, o.Shared.PartSizeBytes())
 			if err != nil {
 				return &errorpkg.Error{Op: "cp", Src: srcURL.Absolute(), Dst: dstURL.String(), Err: err}
 			}
@@ -518,11 +565,11 @@ func (o *Options) syncLocalToLocal(ctx context.Context, store *storage.Storage, 
 		}
 	}
 
-	srcObjects, err := o.listObjects(ctx, store, src, !o.Shared.NoFollowSymlinks)
+	srcObjects, err := o.listObjects(ctx, store, src, !o.Shared.NoFollowSymlinks, false)
 	if err != nil {
 		return err
 	}
-	dstObjects, err := o.listObjects(ctx, store, dst, !o.Shared.NoFollowSymlinks)
+	dstObjects, err := o.listDestObjects(ctx, store, dst, !o.Shared.NoFollowSymlinks)
 	if err != nil {
 		return err
 	}
@@ -555,33 +602,26 @@ func (o *Options) sharedMetadata() storage.Metadata {
 	}
 }
 
-// dstForListing returns the URL to use when listing the destination for
-// the merge-compare. For remote prefixes/buckets we need to enumerate
-// every key under the prefix; for local destinations we use the
-// directory URL as-is.
-//
-// Note: listObjects separately clears the Delimiter on remote
-// bucket/prefix URLs so S3 returns a flat recursive listing.
-func dstForListing(dst *storage.StorageURL) *storage.StorageURL {
-	if !dst.IsRemote() {
-		return dst
+// listDestObjects collects the destination objects for the plan. A single
+// remote destination key is Stat'ed directly instead of listing its parent
+// prefix: the parent listing inherited the destination URL's filter (so it
+// returned exactly the key the sync was about to overwrite, which --delete
+// then raced), and for keys under a sub-prefix the delimiter listing only
+// returned a CommonPrefix so the existing destination was never seen at
+// all. A missing destination is an empty listing, not an error: every
+// first-time sync writes to a destination that does not exist yet.
+func (o *Options) listDestObjects(ctx context.Context, store *storage.Storage, dst *storage.StorageURL, followSymlinks bool) ([]*storage.Object, error) {
+	if dst.IsRemote() && !dst.IsBucket() && !dst.IsPrefix() {
+		obj, err := store.Stat(ctx, dst)
+		if err != nil {
+			if errorpkg.IsWarning(err) {
+				return nil, nil
+			}
+			return nil, err
+		}
+		return []*storage.Object{obj}, nil
 	}
-	if dst.IsBucket() {
-		return dst.Clone()
-	}
-	// Remote prefix or key: enumerate under the prefix.
-	if dst.IsPrefix() {
-		return dst.Clone()
-	}
-	// Single remote key: list the parent prefix so we can see whether
-	// the key exists.
-	parent := dst.Clone()
-	parent.Path = path.Dir(dst.Path)
-	if parent.Path == "." || parent.Path == "" {
-		parent.Path = ""
-	}
-	parent.Prefix = parent.Path
-	return parent
+	return o.listObjects(ctx, store, dst, followSymlinks, true)
 }
 
 // --- sync strategy ---

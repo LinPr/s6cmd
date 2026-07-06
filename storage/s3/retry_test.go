@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -200,6 +201,111 @@ func TestPut_NoSuchUpload_RetryGivesUp(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&putCount); got < 2 {
 		t.Fatalf("expected at least 2 PUT attempts, got %d", got)
+	}
+}
+
+// TestPut_RetryOnNoSuchUpload_RewindsBody verifies that the retry rewinds
+// the (seekable) request body before re-uploading. The first attempt
+// consumes the body; without the Seek the retry would upload 0 bytes.
+func TestPut_RetryOnNoSuchUpload_RewindsBody(t *testing.T) {
+	t.Parallel()
+
+	content := []byte("full body content")
+	var mu sync.Mutex
+	var failNext = true
+	var successBody []byte
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			fail := failNext
+			failNext = false
+			if !fail {
+				successBody = body
+			}
+			mu.Unlock()
+			if fail {
+				w.Header().Set("Content-Type", "application/xml")
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = io.WriteString(w, s3ErrorXML("NoSuchUpload", "simulated"))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		// HeadObject (Stat): 404 so the retry loop re-uploads.
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, s3ErrorXML("NotFound", "not found"))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	store := newS3StoreForTest(t, server.URL, 3)
+
+	to, err := storage.NewStorageURL("s3://bucket/key")
+	if err != nil {
+		t.Fatalf("NewStorageURL: %v", err)
+	}
+	err = store.Put(context.Background(), bytes.NewReader(content), to, storage.Metadata{}, 1, 5*1024*1024)
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if string(successBody) != string(content) {
+		t.Fatalf("retried upload body: want %q, got %q (body was not rewound)", content, successBody)
+	}
+}
+
+// nonSeekableReader wraps an io.Reader and deliberately hides any Seek
+// method, mimicking stdin/pipe bodies.
+type nonSeekableReader struct{ r io.Reader }
+
+func (n *nonSeekableReader) Read(p []byte) (int, error) { return n.r.Read(p) }
+
+// TestPut_NoSuchUpload_NonSeekableBody_NoRetry verifies that when the body
+// cannot be rewound (stdin/pipe), the store does NOT retry — retrying would
+// upload truncated data — and instead returns the original error wrapped
+// with a clear message.
+func TestPut_NoSuchUpload_NonSeekableBody_NoRetry(t *testing.T) {
+	t.Parallel()
+
+	var putCount int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			atomic.AddInt32(&putCount, 1)
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, s3ErrorXML("NoSuchUpload", "simulated"))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, s3ErrorXML("NotFound", "not found"))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	store := newS3StoreForTest(t, server.URL, 3)
+
+	to, err := storage.NewStorageURL("s3://bucket/key")
+	if err != nil {
+		t.Fatalf("NewStorageURL: %v", err)
+	}
+	body := &nonSeekableReader{r: bytes.NewReader([]byte("hello"))}
+	err = store.Put(context.Background(), body, to, storage.Metadata{}, 1, 5*1024*1024)
+	if err == nil {
+		t.Fatalf("expected Put to fail for a non-seekable body")
+	}
+	if !strings.Contains(err.Error(), "not seekable") {
+		t.Fatalf("expected error to explain the body is not seekable, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "NoSuchUpload") {
+		t.Fatalf("expected error to wrap the original NoSuchUpload, got %v", err)
+	}
+	if got := atomic.LoadInt32(&putCount); got != 1 {
+		t.Fatalf("expected exactly 1 PUT attempt for a non-seekable body, got %d", got)
 	}
 }
 

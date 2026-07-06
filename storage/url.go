@@ -489,14 +489,39 @@ func hasGlobCharacter(s string) bool {
 	return strings.ContainsAny(s, globCharacters)
 }
 
+// EnsureLocalRelPath guards download destinations against path traversal.
+// rel is a slash-separated relative path derived from the remote object key
+// (the key with the listing prefix stripped, or its base name); it is about
+// to be joined onto a local destination directory. A bucket controlled by
+// someone else may contain keys like "../../.ssh/authorized_keys" which
+// would escape the destination directory once joined, so any rel that is
+// not a purely local path (per filepath.IsLocal: no "..", not absolute,
+// not empty) is rejected. key is only used in the error message.
+func EnsureLocalRelPath(key, rel string) error {
+	if !filepath.IsLocal(filepath.FromSlash(rel)) {
+		return fmt.Errorf("object key %q resolves to a path outside the destination directory", key)
+	}
+	return nil
+}
+
+// EscapedPath returns "bucket/key" percent-encoded for use as an S3
+// CopySource header. Each path segment is encoded with url.PathEscape
+// (QueryEscape would turn spaces into "+", which S3 reads as a literal plus
+// and thus a different key) while the "/" separators are preserved. When the
+// URL carries a VersionID, the "?versionId=<id>" subresource is appended so
+// server-side copies read the requested version.
 func (u *StorageURL) EscapedPath() string {
 	sourceKey := strings.TrimPrefix(u.String(), "s3://")
 	sourceKeyElements := strings.Split(sourceKey, "/")
 	for i, element := range sourceKeyElements {
-		sourceKeyElements[i] = url.QueryEscape(element)
+		sourceKeyElements[i] = url.PathEscape(element)
 	}
 
-	return strings.Join(sourceKeyElements, "/") // nosem - silence semgrep's "use path.Join" error
+	escaped := strings.Join(sourceKeyElements, "/") // nosem - silence semgrep's "use path.Join" error
+	if u.VersionID != "" {
+		escaped += "?versionId=" + url.QueryEscape(u.VersionID)
+	}
+	return escaped
 }
 
 // check if all fields of StorageURL equal

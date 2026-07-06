@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/LinPr/s6cmd/internal/cliutil"
+	"github.com/LinPr/s6cmd/log"
 	"github.com/LinPr/s6cmd/storage"
 	"github.com/go-playground/validator/v10"
 	"github.com/spf13/cobra"
@@ -29,18 +30,17 @@ func NewGetCmd() *cobra.Command {
 			if err := o.validate(); err != nil {
 				return err
 			}
-			ctx := cmd.Context()
-			if o.DryRun {
-				fmt.Fprintf(cmd.OutOrStdout(), "DRYRUN: get %s %s\n", o.S3Uri, o.FsPath)
-				return nil
-			}
-			return o.run(ctx)
+			return o.run(cmd.Context())
 		},
 	}
 
-	cmd.Flags().BoolVarP(&o.DryRun, "dryRun", "n", false, "show what would be transferred")
+	cmd.Flags().BoolVarP(&o.DryRun, "dry-run", "n", false, "plan the download and print one line per object without writing any local file")
 	cmd.Flags().BoolVarP(&o.Recursive, "recursive", "r", false, "download objects recursively")
 	cmd.Flags().IntVarP(&o.Jobs, "jobs", "j", 1, "number of concurrent operations")
+	// Same names/semantics as cp's SharedFlags: per-object multipart tuning
+	// (as opposed to --jobs, which bounds how many objects transfer at once).
+	cmd.Flags().IntVar(&o.Concurrency, "concurrency", cliutil.DefaultCopyConcurrency, "number of concurrent parts transferred per object")
+	cmd.Flags().IntVar(&o.PartSizeMiB, "part-size", cliutil.DefaultPartSizeMiB, "size of each part transferred per object, in MiB")
 
 	return &cmd
 }
@@ -50,21 +50,19 @@ type Args struct {
 	FsPath string `validate:"omitempty"`
 }
 type Flags struct {
-	DryRun       bool `json:"DryRun" yaml:"DryRun"`
-	EndpointUrl  string
-	NoVerifySSL  bool
-	NoPaginate   bool
-	Output       string
-	Profile      string
-	Region       string
-	PathStyle    bool
-	Recursive    bool
-	Jobs         int
+	DryRun    bool `json:"DryRun" yaml:"DryRun"`
+	Recursive bool
+	Jobs      int
+	// Concurrency/PartSizeMiB mirror cp's SharedFlags: per-object multipart
+	// tuning, converted to bytes via cliutil.PartSizeBytesFromMiB.
+	Concurrency int
+	PartSizeMiB int
 }
 
 type Options struct {
 	Args
 	Flags
+	common cliutil.CommonFlags
 }
 
 func newOptions() *Options {
@@ -72,14 +70,10 @@ func newOptions() *Options {
 }
 
 func (o *Options) complete(cmd *cobra.Command) error {
-	flags := cliutil.LoadParentFlags(cmd)
-	o.EndpointUrl = flags.EndpointURL
-	o.NoVerifySSL = flags.NoVerifySSL
-	o.NoPaginate = flags.NoPaginate
-	o.Output = flags.Output
-	o.Profile = flags.Profile
-	o.Region = flags.Region
-	o.PathStyle = flags.PathStyle
+	o.common = cliutil.LoadParentFlags(cmd)
+	// Propagate --dry-run into the store constructors: listing runs for
+	// real, DownloadFile becomes a no-op that never creates local files.
+	o.common.DryRun = o.DryRun
 	return nil
 }
 
@@ -105,20 +99,12 @@ func (o *Options) run(ctx context.Context) error {
 		return fmt.Errorf("get source must be s3://")
 	}
 
-	store, err := cliutil.NewStorage(ctx, cliutil.CommonFlags{
-		EndpointURL: o.EndpointUrl,
-		NoVerifySSL: o.NoVerifySSL,
-		NoPaginate:  o.NoPaginate,
-		Output:      o.Output,
-		Profile:     o.Profile,
-		Region:      o.Region,
-		PathStyle:   o.PathStyle,
-	})
+	store, err := cliutil.NewStorage(ctx, o.common)
 	if err != nil {
 		return err
 	}
 
-	return downloadS3ToLocal(ctx, store, srcURL, destURL, o.Recursive, o.Jobs)
+	return downloadS3ToLocal(ctx, store, srcURL, destURL, o.Recursive, o.Jobs, o.Concurrency, cliutil.PartSizeBytesFromMiB(o.PartSizeMiB))
 }
 
 func listS3KeysForGet(ctx context.Context, store *storage.Storage, src *storage.StorageURL, recursive bool) ([]string, string, error) {
@@ -151,7 +137,7 @@ func listS3KeysForGet(ctx context.Context, store *storage.Storage, src *storage.
 	return []string{src.Path}, src.Path, nil
 }
 
-func downloadS3ToLocal(ctx context.Context, store *storage.Storage, src, dest *storage.StorageURL, recursive bool, jobs int) error {
+func downloadS3ToLocal(ctx context.Context, store *storage.Storage, src, dest *storage.StorageURL, recursive bool, jobs, concurrency int, partSize int64) error {
 	keys, srcPrefix, err := listS3KeysForGet(ctx, store, src, recursive)
 	if err != nil {
 		return err
@@ -173,11 +159,18 @@ func downloadS3ToLocal(ctx context.Context, store *storage.Storage, src, dest *s
 		switch {
 		case src.IsWildcard():
 			if src.Match(key) {
-				destPath = filepath.Join(dest.Path, filepath.FromSlash(src.Relative()))
+				rel := src.Relative()
+				if err := storage.EnsureLocalRelPath(key, rel); err != nil {
+					return err
+				}
+				destPath = filepath.Join(dest.Path, filepath.FromSlash(rel))
 			}
 		case src.IsPrefix() || src.IsBucket():
 			rel := strings.TrimPrefix(key, srcPrefix)
 			rel = strings.TrimPrefix(rel, "/")
+			if err := storage.EnsureLocalRelPath(key, rel); err != nil {
+				return err
+			}
 			destPath = filepath.Join(dest.Path, filepath.FromSlash(rel))
 		default:
 			isDir, err := cliutil.IsLocalDir(dest.Path)
@@ -185,7 +178,11 @@ func downloadS3ToLocal(ctx context.Context, store *storage.Storage, src, dest *s
 				return err
 			}
 			if isDir {
-				destPath = filepath.Join(dest.Path, path.Base(key))
+				base := path.Base(key)
+				if err := storage.EnsureLocalRelPath(key, base); err != nil {
+					return err
+				}
+				destPath = filepath.Join(dest.Path, base)
 			} else {
 				destPath = dest.Path
 			}
@@ -196,7 +193,11 @@ func downloadS3ToLocal(ctx context.Context, store *storage.Storage, src, dest *s
 		dlKey := key
 		dlPath := destPath
 		tasks = append(tasks, func() error {
-			return store.DownloadFile(ctx, src.Bucket, dlKey, dlPath)
+			if err := store.DownloadFile(ctx, src.Bucket, dlKey, dlPath, concurrency, partSize); err != nil {
+				return err
+			}
+			log.Info(log.InfoMessage{Operation: "get", Source: "s3://" + src.Bucket + "/" + dlKey, Destination: dlPath})
+			return nil
 		})
 	}
 

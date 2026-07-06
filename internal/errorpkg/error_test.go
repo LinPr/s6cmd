@@ -27,10 +27,10 @@ func TestError_Error_NoUnderlying(t *testing.T) {
 func TestError_Error_WithUnderlying(t *testing.T) {
 	t.Parallel()
 	e := &errorpkg.Error{
-		Op:   "cp",
-		Src:  "s3://b/a",
-		Dst:  "s3://b/b",
-		Err:  errors.New("boom"),
+		Op:  "cp",
+		Src: "s3://b/a",
+		Dst: "s3://b/b",
+		Err: errors.New("boom"),
 	}
 	if got := e.Error(); got != "boom" {
 		t.Errorf("Error() = %q, want %q", got, "boom")
@@ -109,12 +109,29 @@ func TestIsCancelation_JoinedWithCanceled(t *testing.T) {
 	}
 }
 
-// TestIsCancelation_StringFallback verifies the string-match fallback for
-// opaque wrappers that don't implement Unwrap correctly.
-func TestIsCancelation_StringFallback(t *testing.T) {
+// TestIsCancelation_DeadlineExceeded verifies that a timeout is treated as
+// a real failure, not a cancelation: a timed-out transfer must not exit 0.
+func TestIsCancelation_DeadlineExceeded(t *testing.T) {
 	t.Parallel()
-	// A plain errors.New with the cancelation message is not unwrappable
-	// to context.Canceled; the fallback string match should catch it.
+	if errorpkg.IsCancelation(context.DeadlineExceeded) {
+		t.Errorf("IsCancelation(context.DeadlineExceeded) = true, want false")
+	}
+	wrapped := fmt.Errorf("upload: %w", context.DeadlineExceeded)
+	if errorpkg.IsCancelation(wrapped) {
+		t.Errorf("IsCancelation(wrapped DeadlineExceeded) = true, want false")
+	}
+	// smithy wraps ctx.Err(); a CanceledError carrying a deadline error
+	// is a timeout, not a user cancelation.
+	smithyDeadline := &smithy.CanceledError{Err: context.DeadlineExceeded}
+	if errorpkg.IsCancelation(smithyDeadline) {
+		t.Errorf("IsCancelation(smithy.CanceledError{DeadlineExceeded}) = true, want false")
+	}
+}
+
+// TestIsCancelation_NoStringMatching verifies that error messages merely
+// mentioning cancelation are not classified by substring anymore.
+func TestIsCancelation_NoStringMatching(t *testing.T) {
+	t.Parallel()
 	cases := []string{
 		"context canceled",
 		"operation canceled, please retry",
@@ -122,8 +139,8 @@ func TestIsCancelation_StringFallback(t *testing.T) {
 	}
 	for _, msg := range cases {
 		err := errors.New(msg)
-		if !errorpkg.IsCancelation(err) {
-			t.Errorf("IsCancelation(%q) = false, want true", msg)
+		if errorpkg.IsCancelation(err) {
+			t.Errorf("IsCancelation(%q) = true, want false (no substring matching)", msg)
 		}
 	}
 }
@@ -168,18 +185,17 @@ func TestIsWarning_NotWarning(t *testing.T) {
 }
 
 // TestIsWarning_WrappedSentinel verifies that wrapping a sentinel still
-// reports true. This documents the current implementation: IsWarning uses a
-// direct == comparison, so wrapped sentinels are NOT recognized. Callers
-// should pass the unwrapped sentinel.
+// reports true: IsWarning uses errors.Is per sentinel, so fmt.Errorf %w
+// wrappers and *errorpkg.Error decorations are recognized.
 func TestIsWarning_WrappedSentinel(t *testing.T) {
 	t.Parallel()
 	wrapped := fmt.Errorf("cp: %w", errorpkg.ErrObjectExists)
-	if errorpkg.IsWarning(wrapped) {
-		t.Errorf("IsWarning(wrapped ErrObjectExists) = true, want false (sentinels are compared by ==")
+	if !errorpkg.IsWarning(wrapped) {
+		t.Errorf("IsWarning(wrapped ErrObjectExists) = false, want true")
 	}
-	// Unwrapping first gives the sentinel back, and IsWarning must accept it.
-	if unwrapped := errors.Unwrap(wrapped); !errorpkg.IsWarning(unwrapped) {
-		t.Errorf("IsWarning(Unwrap(wrapped)) = false, want true")
+	decorated := &errorpkg.Error{Op: "cp", Src: "a", Dst: "b", Err: errorpkg.ErrObjectIsNewer}
+	if !errorpkg.IsWarning(decorated) {
+		t.Errorf("IsWarning(*errorpkg.Error{ErrObjectIsNewer}) = false, want true")
 	}
 }
 

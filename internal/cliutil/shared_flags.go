@@ -46,7 +46,7 @@ type SharedFlags struct {
 	// MetadataDirective controls COPY vs REPLACE semantics on CopyObject.
 	MetadataDirective string
 	// SSE / SSEKMSKeyID configure server-side encryption on the target.
-	SSE string
+	SSE         string
 	SSEKMSKeyID string
 	// ACL sets the canned ACL on the target object.
 	ACL string
@@ -87,10 +87,18 @@ func NewSharedFlags() *SharedFlags {
 // storage.Get/Put expects. It is a method so callers do not have to know
 // the conversion factor.
 func (sf *SharedFlags) PartSizeBytes() int64 {
-	if sf.PartSizeMiB <= 0 {
-		return int64(DefaultPartSizeMiB) * megabyte
+	return PartSizeBytesFromMiB(sf.PartSizeMiB)
+}
+
+// PartSizeBytesFromMiB converts a --part-size value (MiB) to bytes, falling
+// back to DefaultPartSizeMiB when the value is non-positive. Commands that
+// register their own --part-size flag (cat, pipe) share this conversion so
+// the MiB-to-bytes factor is declared in exactly one place.
+func PartSizeBytesFromMiB(miB int) int64 {
+	if miB <= 0 {
+		miB = DefaultPartSizeMiB
 	}
-	return int64(sf.PartSizeMiB) * megabyte
+	return int64(miB) * megabyte
 }
 
 // MetadataMap returns a copy of the user metadata map. It returns nil when

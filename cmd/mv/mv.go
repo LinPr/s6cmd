@@ -2,12 +2,15 @@
 // is cp + delete-source, and uses cobra + aws-sdk-go-v2 + the s6cmd
 // parallel.Manager/Waiter framework.
 //
-// mv is structurally cp+delete: each source object is copied to the
-// destination via the same SharedFlags-driven path (so --concurrency /
+// mv is structurally cp+delete: each source object is transferred via the
+// same cliutil.TransferSpec plumbing cp uses (so --concurrency /
 // --part-size / --metadata / --storage-class / --acl / --sse / --exclude /
-// --include / ... all work), and the source is removed only after the
-// copy/download/upload phase has completed with no failures. If any task
-// errors, the source is left intact so a re-run does not lose data.
+// --include / --no-follow-symlinks all work), and each source is removed
+// only after ITS OWN transfer succeeded. Tracking success per object (as
+// opposed to the previous "upload a snapshot of the file list, then
+// os.RemoveAll the source tree") closes a data-loss window: files created
+// between the source walk and the delete phase, and files whose transfer
+// failed, are left in place so a re-run does not lose data.
 //
 // Tasks run on the global parallel.Manager; errors are aggregated from the
 // Waiter's error channel and returned as a single errors.Join error so the
@@ -16,16 +19,17 @@ package mv
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"io"
+	"io/fs"
 	"os"
-	"path"
 	"path/filepath"
-	"strings"
+	"sync"
 
 	"github.com/LinPr/s6cmd/internal/cliutil"
 	"github.com/LinPr/s6cmd/internal/errorpkg"
 	"github.com/LinPr/s6cmd/internal/parallel"
+	"github.com/LinPr/s6cmd/internal/progressbar"
 	"github.com/LinPr/s6cmd/log"
 	"github.com/LinPr/s6cmd/storage"
 	"github.com/go-playground/validator/v10"
@@ -46,18 +50,13 @@ func NewMvCmd() *cobra.Command {
 			if err := o.validate(); err != nil {
 				return err
 			}
-			ctx := cmd.Context()
-			if o.DryRun {
-				fmt.Fprintf(cmd.OutOrStdout(), "DRYRUN: mv %s %s\n", o.Source, o.Destination)
-				return nil
-			}
-			return o.run(ctx)
+			return o.run(cmd.Context())
 		},
 	}
 
 	// mv-specific flags.
-	cmd.Flags().BoolVarP(&o.DryRun, "dryRun", "n", false, "show what would be transferred")
-	cmd.Flags().BoolVarP(&o.Recursive, "recursive", "r", false, "move objects recursively")
+	cmd.Flags().BoolVarP(&o.DryRun, "dry-run", "n", false, "plan the move and print one line per operation without transferring or deleting anything")
+	cmd.Flags().BoolVarP(&o.Recursive, "recursive", "r", false, "move prefix/bucket/directory sources recursively (required for such sources)")
 	// --jobs is kept as a backwards-compatible alias for SharedFlags's
 	// --concurrency. The SharedFlags value is the one the transfer path
 	// reads; when the user passes --jobs we copy it into Shared.Concurrency
@@ -110,6 +109,10 @@ func (o *Options) complete(cmd *cobra.Command, args []string) error {
 		o.Destination = args[1]
 	}
 	o.CommonFlags = cliutil.LoadParentFlags(cmd)
+	// Propagate --dry-run into the store constructors so every mutating
+	// storage call becomes a no-op while the plan/list/filter phases run
+	// for real. The local delete phase checks the flag directly.
+	o.CommonFlags.DryRun = o.DryRun
 
 	// --jobs is a backwards-compatible alias for --concurrency. When the
 	// user did not pass --concurrency explicitly but did pass --jobs,
@@ -131,6 +134,17 @@ func (o *Options) validate() error {
 	return nil
 }
 
+// spec bundles the per-invocation transfer knobs for cliutil's shared
+// transfer primitives. mv does not expose the override flags
+// (--no-clobber & friends), so ShouldOverride always allows the transfer.
+func (o *Options) spec() *cliutil.TransferSpec {
+	return &cliutil.TransferSpec{
+		Op:     "mv",
+		DryRun: o.DryRun,
+		Shared: o.Shared,
+	}
+}
+
 func (o *Options) run(ctx context.Context) error {
 	srcURL, err := storage.NewStorageURL(o.Source, storage.WithRaw(o.Shared.Raw))
 	if err != nil {
@@ -140,330 +154,324 @@ func (o *Options) run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if destURL.IsWildcard() {
+		return fmt.Errorf("target %q can not contain glob characters", o.Destination)
+	}
 
 	store, err := cliutil.NewStorage(ctx, o.CommonFlags)
 	if err != nil {
 		return err
 	}
 
-	switch {
-	case srcURL.IsRemote() && destURL.IsRemote():
-		return moveS3ToS3(ctx, store, srcURL, destURL, o)
-	case srcURL.IsRemote() && !destURL.IsRemote():
-		return moveS3ToLocal(ctx, store, srcURL, destURL, o)
-	case !srcURL.IsRemote() && destURL.IsRemote():
-		return moveLocalToS3(ctx, store, srcURL, destURL, o)
-	default:
-		return moveLocalToLocal(srcURL.Path, destURL.Path)
-	}
-}
-
-// runParallel drains the Waiter's error channel into errs while the caller
-// submits tasks via parallel.Run. It returns cliutil.AggregateErrors(errs)
-// so a single mv invocation surfaces every failure instead of just the
-// first. The caller is responsible for building the task list and calling
-// parallel.Run for each task; runParallel handles the drain goroutine and
-// the post-Wait aggregation.
-//
-// The submit callback runs synchronously on the caller's goroutine so the
-// errs slice is only touched from the drain goroutine, avoiding the race
-// the previous RunTasks-based implementation had when the delete-source
-// phase read a map written from worker goroutines.
-func runParallel(submit func(waiter *parallel.Waiter) error) error {
-	waiter := parallel.NewWaiter()
-	errs := make([]error, 0)
-	errDoneCh := make(chan struct{})
-	go func() {
-		defer close(errDoneCh)
-		for err := range waiter.Err() {
-			if errorpkg.IsCancelation(err) {
-				continue
-			}
-			if errorpkg.IsWarning(err) {
-				log.Debug(log.DebugMessage{Operation: "mv", Err: err.Error()})
-				continue
-			}
-			log.Error(log.ErrorMessage{Operation: "mv", Err: err.Error()})
-			errs = append(errs, err)
-		}
-	}()
-
-	// If submit returns an error before scheduling any task, surface it
-	// directly; the waiter has nothing to drain in that case.
-	if err := submit(waiter); err != nil {
-		waiter.Wait()
-		<-errDoneCh
-		return cliutil.AggregateErrors(append(errs, err))
+	// Local->local move is a plain rename (with a copy fallback across
+	// filesystems); it never touches S3.
+	if !srcURL.IsRemote() && !destURL.IsRemote() {
+		return o.moveLocalToLocal(srcURL.Path, destURL.Path)
 	}
 
-	waiter.Wait()
-	<-errDoneCh
-	return cliutil.AggregateErrors(errs)
-}
-
-// moveS3ToS3 implements S3-to-S3 move as Copy + Delete-source, matching the
-// mv semantics (the previous implementation only copied, leaving the source
-// object in place, which is cp behaviour, not mv).
-func moveS3ToS3(ctx context.Context, store *storage.Storage, src, dest *storage.StorageURL, o *Options) error {
-	srcIsPrefix := src.IsBucket() || src.IsPrefix()
-	srcPrefix := src.Path
-	if srcIsPrefix {
-		srcPrefix = cliutil.NormalizeRemotePrefix(srcPrefix)
+	// Multi-object sources require an explicit --recursive (mirroring cp
+	// and rm): mv additionally DELETES the source, so a typo'd mv on a
+	// prefix must not wipe it by accident. Wildcard sources stay allowed
+	// without the flag — the pattern itself is an explicit multi-object
+	// request.
+	if err := o.checkRecursive(srcURL); err != nil {
+		return err
 	}
 
-	if srcIsPrefix && !(dest.IsBucket() || dest.IsPrefix()) {
-		return fmt.Errorf("destination must be a prefix when source is a prefix")
+	excludePatterns, err := cliutil.CompileExcludeIncludePatterns(o.Shared.Exclude)
+	if err != nil {
+		return err
+	}
+	includePatterns, err := cliutil.CompileExcludeIncludePatterns(o.Shared.Include)
+	if err != nil {
+		return err
 	}
 
-	destPrefix := dest.Path
-	if srcIsPrefix || dest.IsPrefix() || dest.IsBucket() {
-		destPrefix = cliutil.NormalizeRemotePrefix(destPrefix)
-	}
-
-	keys := []string{src.Path}
-	if srcIsPrefix {
-		var err error
-		keys, err = store.ListS3Keys(ctx, src.Bucket, srcPrefix)
+	srcIsLocalDir := false
+	if !srcURL.IsRemote() && !srcURL.IsWildcard() {
+		srcIsLocalDir, err = cliutil.IsLocalDir(srcURL.Absolute())
 		if err != nil {
 			return err
 		}
 	}
+	isBatch := srcURL.IsWildcard() || srcIsLocalDir ||
+		(srcURL.IsRemote() && (srcURL.IsBucket() || srcURL.IsPrefix()))
 
-	type copyOp struct {
-		srcKey  string
-		destKey string
-	}
-	ops := make([]copyOp, 0, len(keys))
-	for _, key := range keys {
-		var destKey string
-		if srcIsPrefix {
-			rel := strings.TrimPrefix(key, srcPrefix)
-			rel = strings.TrimPrefix(rel, "/")
-			destKey = destPrefix + rel
-		} else if dest.IsBucket() || dest.IsPrefix() {
-			destKey = destPrefix + path.Base(key)
-		} else {
-			destKey = dest.Path
+	// Destination sanity: a multi-object move needs a prefix/directory
+	// destination, otherwise every object would land on the same key.
+	if isBatch {
+		if destURL.IsRemote() && !(destURL.IsBucket() || destURL.IsPrefix()) {
+			return fmt.Errorf("destination must be a bucket or prefix when moving multiple objects")
 		}
+	}
 
-		if src.Bucket == dest.Bucket && key == destKey {
+	objects, err := cliutil.ExpandSource(ctx, store, srcURL, !o.Shared.NoFollowSymlinks)
+	if err != nil {
+		return err
+	}
+
+	pb := progressbar.New(false)
+	pb.Start()
+	defer pb.Finish()
+
+	waiter := parallel.NewWaiter()
+	ec := cliutil.NewErrorCollector("mv")
+	drainDone := ec.Drain(waiter)
+
+	// moved collects the source URLs whose transfer succeeded; only those
+	// are deleted afterwards. Tasks append concurrently, hence the mutex.
+	var (
+		movedMu sync.Mutex
+		moved   []*storage.StorageURL
+	)
+
+	spec := o.spec()
+	for _, object := range objects {
+		if object.Err != nil {
+			ec.Collect(object.Err)
 			continue
 		}
-		ops = append(ops, copyOp{srcKey: key, destKey: destKey})
-	}
-
-	// Copy phase on the parallel.Manager. The delete-source phase only
-	// runs when the copy phase had no errors, so a partial failure leaves
-	// the source intact.
-	if err := runParallel(func(waiter *parallel.Waiter) error {
-		for _, op := range ops {
-			op := op
-			parallel.Run(func() error {
-				if err := store.CopyS3Object(ctx, src.Bucket, op.srcKey, dest.Bucket, op.destKey); err != nil {
-					return &errorpkg.Error{Op: "mv", Src: "s3://" + src.Bucket + "/" + op.srcKey, Dst: "s3://" + dest.Bucket + "/" + op.destKey, Err: err}
-				}
-				log.Info(log.InfoMessage{Operation: "mv", Source: "s3://" + src.Bucket + "/" + op.srcKey, Destination: "s3://" + dest.Bucket + "/" + op.destKey})
-				return nil
-			}, waiter)
+		if object.Type.IsDir() {
+			continue
 		}
-		return nil
-	}); err != nil {
-		return err
-	}
-
-	// Delete-source phase (mv semantics: copy succeeded, now remove source).
-	srcKeys := make([]string, 0, len(ops))
-	for _, op := range ops {
-		srcKeys = append(srcKeys, op.srcKey)
-	}
-	return cliutil.DeleteS3KeysInBatches(ctx, store, src.Bucket, srcKeys)
-}
-
-func moveS3ToLocal(ctx context.Context, store *storage.Storage, src, dest *storage.StorageURL, o *Options) error {
-	srcIsPrefix := src.IsBucket() || src.IsPrefix()
-	srcPrefix := src.Path
-	if srcIsPrefix {
-		srcPrefix = cliutil.NormalizeRemotePrefix(srcPrefix)
-	}
-
-	if srcIsPrefix {
-		isDir, err := cliutil.IsLocalDir(dest.Path)
-		if err != nil {
-			return err
+		if !object.Type.IsRegular() {
+			ec.Collect(fmt.Errorf("object %v is not a regular file", object))
+			continue
 		}
-		if !isDir {
-			return fmt.Errorf("destination must be a directory when source is a prefix")
-		}
-	}
-
-	keys := []string{src.Path}
-	if srcIsPrefix {
-		var err error
-		keys, err = store.ListS3Keys(ctx, src.Bucket, srcPrefix)
-		if err != nil {
-			return err
-		}
-	}
-
-	type downloadOp struct {
-		key      string
-		destPath string
-	}
-	ops := make([]downloadOp, 0, len(keys))
-	for _, key := range keys {
-		var destPath string
-		if srcIsPrefix {
-			rel := strings.TrimPrefix(key, srcPrefix)
-			rel = strings.TrimPrefix(rel, "/")
-			destPath = filepath.Join(dest.Path, filepath.FromSlash(rel))
-		} else {
-			isDir, err := cliutil.IsLocalDir(dest.Path)
-			if err != nil {
-				return err
-			}
-			if isDir {
-				destPath = filepath.Join(dest.Path, path.Base(key))
-			} else {
-				destPath = dest.Path
+		// For a local directory source mv moves the directory's CONTENTS
+		// (mv dir s3://b/ produces s3://b/<rel>, not s3://b/dir/<rel>),
+		// matching the previous behaviour; cp mirrors the base name
+		// instead. Re-derive the relative path against the source dir.
+		if srcIsLocalDir {
+			if rel, relErr := filepath.Rel(srcURL.Absolute(), object.StorageURL.Absolute()); relErr == nil {
+				object.StorageURL.SetRelativePath(filepath.ToSlash(rel))
 			}
 		}
-		ops = append(ops, downloadOp{key: key, destPath: destPath})
-	}
-
-	if err := runParallel(func(waiter *parallel.Waiter) error {
-		for _, op := range ops {
-			op := op
-			parallel.Run(func() error {
-				if err := store.DownloadFile(ctx, src.Bucket, op.key, op.destPath); err != nil {
-					return &errorpkg.Error{Op: "mv", Src: "s3://" + src.Bucket + "/" + op.key, Dst: op.destPath, Err: err}
-				}
-				log.Info(log.InfoMessage{Operation: "mv", Source: "s3://" + src.Bucket + "/" + op.key, Destination: op.destPath})
-				return nil
-			}, waiter)
+		name := object.StorageURL.Relative()
+		if name == "" {
+			name = object.StorageURL.Absolute()
 		}
-		return nil
-	}); err != nil {
-		return err
-	}
+		if cliutil.IsObjectExcluded(name, excludePatterns, includePatterns) {
+			continue
+		}
 
-	// Delete source objects after successful download (mv semantics).
-	srcKeys := make([]string, 0, len(ops))
-	for _, op := range ops {
-		srcKeys = append(srcKeys, op.key)
+		srcObj := object.StorageURL
+		task := func() error {
+			var terr error
+			switch {
+			case srcURL.IsRemote() && destURL.IsRemote():
+				dst := cliutil.PrepareRemoteDestination(srcObj, destURL, false, isBatch)
+				if srcObj.Bucket == dst.Bucket && srcObj.Path == dst.Path {
+					// Moving an object onto itself would copy then delete
+					// it; skip it instead.
+					return nil
+				}
+				if terr = spec.Copy(ctx, store, srcObj, dst); terr != nil {
+					terr = &errorpkg.Error{Op: "mv", Src: srcObj.String(), Dst: dst.String(), Err: terr}
+				}
+			case srcURL.IsRemote() && !destURL.IsRemote():
+				dst, derr := cliutil.PrepareLocalDestination(ctx, store, srcObj, destURL, false, isBatch)
+				if derr != nil {
+					return &errorpkg.Error{Op: "mv", Src: srcObj.String(), Dst: destURL.String(), Err: derr}
+				}
+				if terr = spec.Download(ctx, store, srcObj, dst, pb); terr != nil {
+					terr = &errorpkg.Error{Op: "mv", Src: srcObj.String(), Dst: dst.Absolute(), Err: terr}
+				}
+			case !srcURL.IsRemote() && destURL.IsRemote():
+				dst := cliutil.PrepareRemoteDestination(srcObj, destURL, false, isBatch)
+				if terr = spec.Upload(ctx, store, srcObj, dst, pb); terr != nil {
+					terr = &errorpkg.Error{Op: "mv", Src: srcObj.Absolute(), Dst: dst.String(), Err: terr}
+				}
+			default:
+				return fmt.Errorf("unsupported mv pair: src=%v dst=%v", srcURL, destURL)
+			}
+			if terr != nil {
+				// Warnings (skipped transfers) propagate so the collector
+				// logs them at debug level; either way the source is NOT
+				// recorded as moved and stays in place.
+				return terr
+			}
+			movedMu.Lock()
+			moved = append(moved, srcObj)
+			movedMu.Unlock()
+			return nil
+		}
+		parallel.Run(task, waiter)
 	}
-	return cliutil.DeleteS3KeysInBatches(ctx, store, src.Bucket, srcKeys)
+	waiter.Wait()
+	drainDone()
+
+	// Delete-source phase: remove exactly the sources whose transfer
+	// succeeded (mv semantics). Failed or skipped transfers keep their
+	// source so a re-run can pick them up.
+	ec.Collect(o.deleteMovedSources(ctx, store, srcURL, srcIsLocalDir, moved))
+
+	return ec.Aggregate()
 }
 
-func moveLocalToS3(ctx context.Context, store *storage.Storage, src, dest *storage.StorageURL, o *Options) error {
-	files, err := cliutil.ListLocalFiles(src.Path, o.Recursive)
+// checkRecursive rejects prefix/bucket/directory sources unless
+// --recursive was passed. Wildcard (and --raw) sources are exempt.
+func (o *Options) checkRecursive(srcURL *storage.StorageURL) error {
+	if o.Recursive || srcURL.IsWildcard() {
+		return nil
+	}
+	if srcURL.IsRemote() {
+		if srcURL.IsBucket() || srcURL.IsPrefix() {
+			return fmt.Errorf("source %q is a bucket/prefix (use --recursive)", o.Source)
+		}
+		return nil
+	}
+	isDir, err := cliutil.IsLocalDir(srcURL.Absolute())
 	if err != nil {
 		return err
 	}
-
-	srcIsDir, err := cliutil.IsLocalDir(src.Path)
-	if err != nil {
-		return err
+	if isDir {
+		return fmt.Errorf("source %q is a directory (use --recursive)", o.Source)
 	}
-	if srcIsDir && !(dest.IsBucket() || dest.IsPrefix()) {
-		return fmt.Errorf("destination must be a prefix when source is a directory")
-	}
-
-	destPrefix := dest.Path
-	if srcIsDir || dest.IsBucket() || dest.IsPrefix() {
-		destPrefix = cliutil.NormalizeRemotePrefix(destPrefix)
-	}
-
-	type uploadOp struct {
-		localPath string
-		destKey   string
-	}
-	ops := make([]uploadOp, 0, len(files))
-	for _, filePath := range files {
-		var destKey string
-		if srcIsDir {
-			rel, err := filepath.Rel(src.Path, filePath)
-			if err != nil {
-				return err
-			}
-			rel = filepath.ToSlash(rel)
-			destKey = destPrefix + rel
-		} else if dest.IsBucket() || dest.IsPrefix() {
-			destKey = destPrefix + filepath.Base(filePath)
-		} else {
-			destKey = dest.Path
-		}
-		ops = append(ops, uploadOp{localPath: filePath, destKey: destKey})
-	}
-
-	if err := runParallel(func(waiter *parallel.Waiter) error {
-		for _, op := range ops {
-			op := op
-			parallel.Run(func() error {
-				if _, err := store.UploadFile(ctx, op.localPath, dest.Bucket, op.destKey); err != nil {
-					return &errorpkg.Error{Op: "mv", Src: op.localPath, Dst: "s3://" + dest.Bucket + "/" + op.destKey, Err: err}
-				}
-				log.Info(log.InfoMessage{Operation: "mv", Source: op.localPath, Destination: "s3://" + dest.Bucket + "/" + op.destKey})
-				return nil
-			}, waiter)
-		}
-		return nil
-	}); err != nil {
-		return err
-	}
-
-	// Remove local source (mv semantics). Only run when every upload
-	// succeeded; a partial failure leaves the source files in place.
-	if srcIsDir {
-		return os.RemoveAll(src.Path)
-	}
-	return os.Remove(src.Path)
+	return nil
 }
 
-func moveLocalToLocal(srcPath, destPath string) error {
+// deleteMovedSources removes exactly the sources whose transfer succeeded.
+// Remote sources are deleted in batched DeleteObjects calls (the store
+// no-ops them under dry-run); local sources are removed per file, then
+// now-empty directories under a directory source are pruned. Files that
+// appeared after the source listing — or whose transfer failed — are left
+// untouched, so a partial mv never destroys data that was not transferred.
+func (o *Options) deleteMovedSources(ctx context.Context, store *storage.Storage, src *storage.StorageURL, srcIsLocalDir bool, moved []*storage.StorageURL) error {
+	if len(moved) == 0 {
+		return nil
+	}
+	if src.IsRemote() {
+		keys := make([]string, 0, len(moved))
+		for _, u := range moved {
+			keys = append(keys, u.Path)
+		}
+		return cliutil.DeleteS3KeysInBatches(ctx, store, src.Bucket, keys)
+	}
+
+	// Local source: never delete anything under dry-run (the transfers
+	// above were store-level no-ops).
+	if o.DryRun {
+		return nil
+	}
+	var errs []error
+	for _, u := range moved {
+		if err := os.Remove(u.Absolute()); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if srcIsLocalDir {
+		pruneEmptyDirs(src.Absolute())
+	}
+	return errors.Join(errs...)
+}
+
+// pruneEmptyDirs removes the directories under root (and root itself)
+// that are empty after the per-file deletes, children first. Directories
+// that still contain files — e.g. files created between the source
+// listing and the delete phase, or files whose transfer failed — are left
+// in place: os.Remove refuses to remove a non-empty directory, which is
+// exactly the guard the data-safety contract relies on.
+func pruneEmptyDirs(root string) {
+	var dirs []string
+	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			dirs = append(dirs, p)
+		}
+		return nil
+	})
+	// WalkDir visits parents before children; delete in reverse so leaf
+	// directories go first.
+	for i := len(dirs) - 1; i >= 0; i-- {
+		_ = os.Remove(dirs[i])
+	}
+}
+
+// moveLocalToLocal renames srcPath to destPath with POSIX mv semantics:
+// when destPath is an existing directory the source is moved INTO it
+// (destPath/Base(srcPath)) rather than having its contents merged into the
+// directory, which is what the previous implementation did.
+func (o *Options) moveLocalToLocal(srcPath, destPath string) error {
 	srcIsDir, err := cliutil.IsLocalDir(srcPath)
 	if err != nil {
 		return err
 	}
-	if srcIsDir {
-		isDir, err := cliutil.IsLocalDir(destPath)
-		if err != nil {
-			return err
-		}
-		if !isDir {
-			return fmt.Errorf("destination must be a directory when source is a directory")
-		}
+	destIsDir, err := cliutil.IsLocalDir(destPath)
+	if err != nil {
+		return err
+	}
+	if destIsDir {
+		destPath = filepath.Join(destPath, filepath.Base(filepath.Clean(srcPath)))
+	}
+	if o.DryRun {
+		// The filesystem store is bypassed here, so honour --dry-run
+		// explicitly: report the rename that would happen and stop.
+		log.Info(log.InfoMessage{Operation: "mv", Source: srcPath, Destination: destPath})
+		return nil
 	}
 	if err := os.Rename(srcPath, destPath); err != nil {
 		// os.Rename across filesystems returns EXDEV or a link error;
 		// fall back to copy+remove so mv still works on cross-mount
-		// paths. This matches the cp+delete semantics mv uses for S3.
-		if copyErr := copyLocalTree(srcPath, destPath); copyErr != nil {
-			return fmt.Errorf("rename failed (%v) and fallback copy failed (%v)", err, copyErr)
+		// paths.
+		if fbErr := crossDeviceFallback(srcPath, destPath, srcIsDir); fbErr != nil {
+			return fmt.Errorf("rename failed (%v): %v", err, fbErr)
 		}
-		if srcIsDir {
-			return os.RemoveAll(srcPath)
-		}
-		return os.Remove(srcPath)
+		return nil
 	}
 	return nil
+}
+
+// crossDeviceFallback implements mv's copy+delete fallback when os.Rename
+// fails (typically cross-mount). It matches the cp+delete semantics mv
+// uses for S3: only the files that were actually copied are removed — a
+// blanket os.RemoveAll(src) would also destroy files created between the
+// copy walk and the delete, which were never transferred anywhere.
+func crossDeviceFallback(srcPath, destPath string, srcIsDir bool) error {
+	copied, copyErr := copyLocalTree(srcPath, destPath)
+	if copyErr != nil {
+		return fmt.Errorf("fallback copy failed (%v)", copyErr)
+	}
+	if !srcIsDir {
+		return os.Remove(srcPath)
+	}
+	var errs []error
+	for _, p := range copied {
+		if rmErr := os.Remove(p); rmErr != nil {
+			errs = append(errs, rmErr)
+		}
+	}
+	// Prune now-empty directories (children first). os.Remove refuses to
+	// remove a non-empty directory, so any directory still holding an
+	// un-copied file survives — exactly the data-safety guard the
+	// per-file delete provides.
+	pruneEmptyDirs(srcPath)
+	return errors.Join(errs...)
 }
 
 // copyLocalTree is the cross-filesystem fallback for moveLocalToLocal. It
 // is deliberately minimal: walk src, mkdirAll + copy each file to dst. It
 // is only used when os.Rename fails (typically cross-mount), so the hot
-// path is unchanged.
-func copyLocalTree(srcPath, destPath string) error {
+// path is unchanged. It returns the source paths of the files it copied so
+// the caller can delete exactly those and nothing else.
+func copyLocalTree(srcPath, destPath string) ([]string, error) {
 	info, err := os.Stat(srcPath)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if !info.IsDir() {
-		return copyFile(srcPath, destPath)
+		if err := cliutil.CopyLocalFile(srcPath, destPath); err != nil {
+			return nil, err
+		}
+		return []string{srcPath}, nil
 	}
 	if err := os.MkdirAll(destPath, 0o755); err != nil {
-		return err
+		return nil, err
 	}
-	return filepath.Walk(srcPath, func(p string, fi os.FileInfo, err error) error {
+	var copied []string
+	err = filepath.Walk(srcPath, func(p string, fi os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -475,26 +483,14 @@ func copyLocalTree(srcPath, destPath string) error {
 		if fi.IsDir() {
 			return os.MkdirAll(dst, fi.Mode())
 		}
-		return copyFile(p, dst)
+		if err := cliutil.CopyLocalFile(p, dst); err != nil {
+			return err
+		}
+		copied = append(copied, p)
+		return nil
 	})
-}
-
-// copyFile is a plain io.Copy with MkdirAll on the destination's dir. It
-// is the local-only fallback; S3 uploads go through store.UploadFile.
-func copyFile(src, dst string) error {
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return err
-	}
-	from, err := os.Open(src)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer from.Close()
-	to, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer to.Close()
-	_, err = io.Copy(to, from)
-	return err
+	return copied, nil
 }

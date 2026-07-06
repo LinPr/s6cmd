@@ -18,12 +18,12 @@ type fakeBar struct {
 	bytes int64
 }
 
-func (f *fakeBar) Start()                       {}
-func (f *fakeBar) Finish()                      {}
-func (f *fakeBar) IncrementCompletedObjects()   {}
-func (f *fakeBar) IncrementTotalObjects()       {}
-func (f *fakeBar) AddCompletedBytes(n int64)    { f.bytes += n }
-func (f *fakeBar) AddTotalBytes(n int64)        {}
+func (f *fakeBar) Start()                     {}
+func (f *fakeBar) Finish()                    {}
+func (f *fakeBar) IncrementCompletedObjects() {}
+func (f *fakeBar) IncrementTotalObjects()     {}
+func (f *fakeBar) AddCompletedBytes(n int64)  { f.bytes += n }
+func (f *fakeBar) AddTotalBytes(n int64)      {}
 
 // newFileWithContent creates a temp file and writes content into it, returning
 // the open *os.File (caller must Close).
@@ -279,9 +279,9 @@ func TestIsObjectExcluded(t *testing.T) {
 	exclude, _ := CompileExcludeIncludePatterns([]string{"*.tmp"})
 	include, _ := CompileExcludeIncludePatterns([]string{"keep*"})
 	tests := []struct {
-		name    string
-		obj     string
-		want    bool
+		name string
+		obj  string
+		want bool
 	}{
 		{"excluded_by_exclude", "file.tmp", true},
 		{"not_excluded_not_included", "other.log", true}, // include non-empty => non-match excludes

@@ -13,9 +13,10 @@
 // next.
 //
 // The parent's effective global flags (--endpoint-url, --profile,
-// --region, --path-style, ...) are resolved via cliutil.LoadParentFlags
-// and prepended to each line's arguments so the user does not have to
-// repeat them on every line of the commands file.
+// --region, --path-style, --use-list-objects-v1, ... via
+// cliutil.LoadParentFlags, plus the root-only --log, --config and --stat)
+// are resolved and prepended to each line's arguments so the user does not
+// have to repeat them on every line of the commands file.
 package run
 
 import (
@@ -87,6 +88,19 @@ type Args struct {
 type Flags struct {
 	NumWorkers int
 	cliutil.CommonFlags
+	// rootForward holds the root-level flags that are not part of
+	// cliutil.CommonFlags (they do not affect storage construction) but
+	// must still be forwarded to child processes so a `--log debug` or
+	// `--config path` on the parent applies to every line.
+	rootForward
+}
+
+// rootForward holds the effective values of the root flags forwarded to
+// children in addition to CommonFlags: --log, --config and --stat.
+type rootForward struct {
+	LogLevel string
+	Config   string
+	Stat     bool
 }
 
 // Options is the closure of Args + Flags + the reader the commands are
@@ -119,6 +133,12 @@ func (o *Options) complete(cmd *cobra.Command, args []string) error {
 		o.File = args[0]
 	}
 	o.CommonFlags = cliutil.LoadParentFlags(cmd)
+	// Root flags outside CommonFlags that children must inherit too.
+	cliutil.ResolveFlags(cmd.Root().PersistentFlags(), []cliutil.FlagBinding{
+		{Name: "log", String: &o.rootForward.LogLevel},
+		{Name: "config", String: &o.rootForward.Config},
+		{Name: "stat", Bool: &o.rootForward.Stat},
+	})
 
 	// Resolve the s6cmd binary path. os.Executable returns the path of
 	// the running process; for `go run` and `go test` this points at the
@@ -185,7 +205,7 @@ func (o *Options) run(ctx context.Context) error {
 	// Build the global-flag prefix once. It is prepended to every child
 	// command line so the user does not have to repeat --endpoint-url /
 	// --profile / --region / ... on every line of the commands file.
-	globalArgs := globalFlagArgs(o.CommonFlags)
+	globalArgs := globalFlagArgs(o.CommonFlags, o.rootForward)
 
 	// parallel.New (NOT parallel.Run) because run needs its own worker
 	// pool sized by --numworkers, independent of the global Manager.
@@ -210,7 +230,9 @@ func (o *Options) run(ctx context.Context) error {
 	}()
 
 	reader := newLineReader(ctx, o.reader)
-	lineno := -1
+	// Line numbers are 1-based so error messages match what an editor
+	// shows for the commands file.
+	lineno := 0
 	for line := range reader.lines() {
 		lineno++
 		line = strings.TrimSpace(line)
@@ -297,11 +319,12 @@ func (o *Options) execChild(ctx context.Context, lineArgs, globalArgs []string, 
 	return nil
 }
 
-// globalFlagArgs converts the resolved CommonFlags back into CLI args so
-// they can be prepended to each child command line. Only non-default
-// values are forwarded; this avoids overriding the child's own flag
-// defaults with empty strings.
-func globalFlagArgs(cf cliutil.CommonFlags) []string {
+// globalFlagArgs converts the resolved CommonFlags (plus the root-only
+// forwarded flags: --log, --config, --stat) back into CLI args so they can
+// be prepended to each child command line. Only non-default values are
+// forwarded; this avoids overriding the child's own flag defaults with
+// empty strings.
+func globalFlagArgs(cf cliutil.CommonFlags, rf rootForward) []string {
 	var args []string
 	if cf.EndpointURL != "" {
 		args = append(args, "--endpoint-url", cf.EndpointURL)
@@ -321,8 +344,13 @@ func globalFlagArgs(cf cliutil.CommonFlags) []string {
 	if cf.Region != "" {
 		args = append(args, "--region", cf.Region)
 	}
-	if cf.PathStyle {
-		args = append(args, "--path-style")
+	// --path-style is tri-state: an explicitly set value (true or false)
+	// must be forwarded verbatim so a child with a custom endpoint does not
+	// re-derive the path-style default and override the user's explicit
+	// --path-style=false. An unset flag is not forwarded; the child applies
+	// the same default policy itself.
+	if cf.PathStyleSet {
+		args = append(args, fmt.Sprintf("--path-style=%v", cf.PathStyle))
 	}
 	if cf.RetryCount > 0 {
 		args = append(args, "--retry-count", fmt.Sprintf("%d", cf.RetryCount))
@@ -336,6 +364,18 @@ func globalFlagArgs(cf cliutil.CommonFlags) []string {
 	if cf.NoSignRequest {
 		args = append(args, "--no-sign-request")
 	}
+	if cf.UseListObjectsV1 {
+		args = append(args, "--use-list-objects-v1")
+	}
+	if rf.LogLevel != "" && rf.LogLevel != "info" {
+		args = append(args, "--log", rf.LogLevel)
+	}
+	if rf.Config != "" {
+		args = append(args, "--config", rf.Config)
+	}
+	if rf.Stat {
+		args = append(args, "--stat")
+	}
 	return args
 }
 
@@ -343,11 +383,26 @@ func globalFlagArgs(cf cliutil.CommonFlags) []string {
 // the underlying reader and pushes them onto a channel; the read loop
 // exits when ctx is cancelled or the underlying reader returns an error
 // (EOF is not surfaced as an error).
+//
+// Cancelation must interrupt a BLOCKED read, not just be checked between
+// reads: `s6cmd run` on an idle stdin/fifo used to sit in ReadString
+// forever, immune to Ctrl-C. Two mechanisms cooperate:
+//
+//   - every channel send selects on ctx.Done(), so the producer never
+//     blocks past a cancelation;
+//   - when the underlying reader is closeable (os.Stdin, the commands
+//     file — both pollable *os.File descriptors), a watcher goroutine
+//     closes it on cancel, which makes the pending Read return
+//     immediately with an error the producer maps back to ctx.Err().
 type lineReader struct {
 	reader *bufio.Reader
 	err    error
 	linech chan string
 	ctx    context.Context
+	// done is closed by the producer goroutine when it exits; it stops
+	// the close-on-cancel watcher so a clean EOF never triggers a stray
+	// Close on a reader the caller still owns.
+	done chan struct{}
 }
 
 // newLineReader builds a cancelable line reader for r.
@@ -356,8 +411,23 @@ func newLineReader(ctx context.Context, r io.Reader) *lineReader {
 		reader: bufio.NewReader(r),
 		linech: make(chan string),
 		ctx:    ctx,
+		done:   make(chan struct{}),
 	}
 	go lr.read()
+	if c, ok := r.(io.Closer); ok {
+		go func() {
+			select {
+			case <-ctx.Done():
+				// Unblock the producer's pending ReadString. For pipes,
+				// FIFOs and terminals (the readers that actually block)
+				// Close makes the poller fail the pending Read.
+				c.Close()
+			case <-lr.done:
+				// Producer finished on its own (EOF or read error);
+				// leave the reader for the caller to close.
+			}
+		}()
+	}
 	return lr
 }
 
@@ -367,22 +437,27 @@ func newLineReader(ctx context.Context, r io.Reader) *lineReader {
 // condition); other errors are surfaced via Err().
 func (r *lineReader) read() {
 	defer close(r.linech)
+	defer close(r.done)
 	for {
-		select {
-		case <-r.ctx.Done():
-			r.err = r.ctx.Err()
-			return
-		default:
-		}
 		line, err := r.reader.ReadString('\n')
 		if line != "" {
-			r.linech <- line
+			select {
+			case r.linech <- line:
+			case <-r.ctx.Done():
+				r.err = r.ctx.Err()
+				return
+			}
 		}
 		if err != nil {
+			// A canceled context is authoritative over the read error:
+			// the close-on-cancel watcher makes the pending read fail
+			// with "file already closed", which would otherwise be
+			// misreported as an I/O failure.
+			if cerr := r.ctx.Err(); cerr != nil {
+				r.err = cerr
+				return
+			}
 			if err == io.EOF {
-				if errors_Is(r.ctx.Err(), context.Canceled) {
-					r.err = r.ctx.Err()
-				}
 				return
 			}
 			r.err = err
@@ -402,26 +477,88 @@ func (r *lineReader) Err() error {
 	return r.err
 }
 
-// errors_Is is a tiny indirection to avoid importing "errors" at the
-// package's top level when only this function uses it. Go 1.20+'s
-// errors.Is is what we want; the indirection keeps the import block
-// focused on the command surface.
-func errors_Is(err, target error) bool {
-	return err != nil && target != nil && err.Error() == target.Error() ||
-		err != nil && target != nil && strings.Contains(err.Error(), target.Error())
-}
-
-// shellquoteSplit is the indirection point for shell-style word
-// splitting. It uses strings.Fields as a minimal implementation that
-// does NOT support quoted strings (e.g. `cp "file with spaces.txt"`).
-// The TODO is tracked against a future switch to kballard/go-shellquote
-// once the dependency is vendored.
+// shellquoteSplit splits a command line into fields with POSIX-like
+// quoting rules, so `rm "s3://bucket/file with spaces"` targets one key
+// instead of three:
 //
-// We deliberately avoid strings.Fields' behaviour of collapsing runs of
-// whitespace inside quotes; for the simple commands that s6cmd run
-// targets (ls, cp, rm, ...), whitespace-separated tokens are sufficient.
-// Users who need quoting can fall back to a shell loop calling s6cmd
-// directly.
+//   - unquoted whitespace separates fields;
+//   - single quotes preserve everything literally up to the closing quote;
+//   - double quotes preserve everything except `\"` and `\\`, which escape
+//     the quote and the backslash respectively;
+//   - an unquoted backslash escapes the next character.
+//
+// An unterminated quote (or a trailing bare backslash) returns an error so
+// a malformed line is rejected instead of silently targeting the wrong
+// key. Empty quoted strings (” / "") produce empty fields.
 func shellquoteSplit(s string) ([]string, error) {
-	return strings.Fields(s), nil
+	const (
+		stateUnquoted = iota
+		stateSingle
+		stateDouble
+	)
+	var (
+		fields  []string
+		cur     []byte
+		inField bool // distinguishes "" (empty field) from no field at all
+	)
+	state := stateUnquoted
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch state {
+		case stateSingle:
+			if c == '\'' {
+				state = stateUnquoted
+			} else {
+				cur = append(cur, c)
+			}
+		case stateDouble:
+			switch c {
+			case '"':
+				state = stateUnquoted
+			case '\\':
+				// Inside double quotes a backslash only escapes the
+				// closing quote and itself; otherwise it is literal.
+				if i+1 < len(s) && (s[i+1] == '"' || s[i+1] == '\\') {
+					i++
+					cur = append(cur, s[i])
+				} else {
+					cur = append(cur, c)
+				}
+			default:
+				cur = append(cur, c)
+			}
+		default: // stateUnquoted
+			switch c {
+			case '\'':
+				state = stateSingle
+				inField = true
+			case '"':
+				state = stateDouble
+				inField = true
+			case '\\':
+				if i+1 >= len(s) {
+					return nil, fmt.Errorf("trailing backslash")
+				}
+				i++
+				cur = append(cur, s[i])
+				inField = true
+			case ' ', '\t', '\n', '\r':
+				if inField {
+					fields = append(fields, string(cur))
+					cur = cur[:0]
+					inField = false
+				}
+			default:
+				cur = append(cur, c)
+				inField = true
+			}
+		}
+	}
+	if state == stateSingle || state == stateDouble {
+		return nil, fmt.Errorf("unterminated quote")
+	}
+	if inField {
+		fields = append(fields, string(cur))
+	}
+	return fields, nil
 }

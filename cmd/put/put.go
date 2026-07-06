@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/LinPr/s6cmd/internal/cliutil"
+	"github.com/LinPr/s6cmd/log"
 	"github.com/LinPr/s6cmd/storage"
 	"github.com/go-playground/validator/v10"
 	"github.com/spf13/cobra"
@@ -29,18 +30,17 @@ func NewPutCmd() *cobra.Command {
 			if err := o.validate(); err != nil {
 				return err
 			}
-			ctx := cmd.Context()
-			if o.DryRun {
-				fmt.Fprintf(cmd.OutOrStdout(), "DRYRUN: put %s %s\n", o.localFile, o.S3Uri)
-				return nil
-			}
-			return o.run(ctx)
+			return o.run(cmd.Context())
 		},
 	}
 
-	cmd.Flags().BoolVarP(&o.DryRun, "dryRun", "n", false, "show what would be transferred")
+	cmd.Flags().BoolVarP(&o.DryRun, "dry-run", "n", false, "plan the upload and print one line per file without uploading anything")
 	cmd.Flags().BoolVarP(&o.Recursive, "recursive", "r", false, "upload objects recursively")
 	cmd.Flags().IntVarP(&o.Jobs, "jobs", "j", 1, "number of concurrent operations")
+	// Same names/semantics as cp's SharedFlags: per-object multipart tuning
+	// (as opposed to --jobs, which bounds how many files transfer at once).
+	cmd.Flags().IntVar(&o.Concurrency, "concurrency", cliutil.DefaultCopyConcurrency, "number of concurrent parts transferred per file")
+	cmd.Flags().IntVar(&o.PartSizeMiB, "part-size", cliutil.DefaultPartSizeMiB, "size of each part transferred per file, in MiB")
 
 	return &cmd
 }
@@ -50,21 +50,19 @@ type Args struct {
 	S3Uri     string `validate:"omitempty"`
 }
 type Flags struct {
-	DryRun      bool `json:"DryRun" yaml:"DryRun"`
-	EndpointUrl string
-	NoVerifySSL bool
-	NoPaginate  bool
-	Output      string
-	Profile     string
-	Region      string
-	PathStyle   bool
-	Recursive   bool
-	Jobs        int
+	DryRun    bool `json:"DryRun" yaml:"DryRun"`
+	Recursive bool
+	Jobs      int
+	// Concurrency/PartSizeMiB mirror cp's SharedFlags: per-object multipart
+	// tuning, converted to bytes via cliutil.PartSizeBytesFromMiB.
+	Concurrency int
+	PartSizeMiB int
 }
 
 type Options struct {
 	Args
 	Flags
+	common cliutil.CommonFlags
 }
 
 func newOptions() *Options {
@@ -72,15 +70,10 @@ func newOptions() *Options {
 }
 
 func (o *Options) complete(cmd *cobra.Command) error {
-	flags := cliutil.LoadParentFlags(cmd)
-	o.EndpointUrl = flags.EndpointURL
-	o.NoVerifySSL = flags.NoVerifySSL
-	o.NoPaginate = flags.NoPaginate
-	o.Output = flags.Output
-	o.Profile = flags.Profile
-	o.Region = flags.Region
-	o.PathStyle = flags.PathStyle
-
+	o.common = cliutil.LoadParentFlags(cmd)
+	// Propagate --dry-run into the store constructors: file listing runs
+	// for real, the Put itself becomes a no-op.
+	o.common.DryRun = o.DryRun
 	return nil
 }
 
@@ -105,20 +98,15 @@ func (o *Options) run(ctx context.Context) error {
 			return fmt.Errorf("destination must be s3:// when using stdin")
 		}
 
-		store, err := cliutil.NewStorage(ctx, cliutil.CommonFlags{
-			EndpointURL: o.EndpointUrl,
-			NoVerifySSL: o.NoVerifySSL,
-			NoPaginate:  o.NoPaginate,
-			Output:      o.Output,
-			Profile:     o.Profile,
-			Region:      o.Region,
-			PathStyle:   o.PathStyle,
-		})
+		store, err := cliutil.NewStorage(ctx, o.common)
 		if err != nil {
 			return err
 		}
-		_, err = store.UploadFromStdin(ctx, parsedDest.Bucket, parsedDest.Path)
-		return err
+		if _, err := store.UploadFromStdin(ctx, parsedDest.Bucket, parsedDest.Path, o.Concurrency, cliutil.PartSizeBytesFromMiB(o.PartSizeMiB)); err != nil {
+			return err
+		}
+		log.Info(log.InfoMessage{Operation: "put", Source: "-", Destination: parsedDest.String()})
+		return nil
 	}
 
 	srcURL, err := storage.NewStorageURL(o.localFile)
@@ -133,20 +121,12 @@ func (o *Options) run(ctx context.Context) error {
 		return fmt.Errorf("put destination must be s3://")
 	}
 
-	store, err := cliutil.NewStorage(ctx, cliutil.CommonFlags{
-		EndpointURL: o.EndpointUrl,
-		NoVerifySSL: o.NoVerifySSL,
-		NoPaginate:  o.NoPaginate,
-		Output:      o.Output,
-		Profile:     o.Profile,
-		Region:      o.Region,
-		PathStyle:   o.PathStyle,
-	})
+	store, err := cliutil.NewStorage(ctx, o.common)
 	if err != nil {
 		return err
 	}
 
-	return uploadLocalToS3(ctx, store, srcURL, destURL, o.Recursive, o.Jobs)
+	return uploadLocalToS3(ctx, store, srcURL, destURL, o.Recursive, o.Jobs, o.Concurrency, cliutil.PartSizeBytesFromMiB(o.PartSizeMiB))
 }
 
 func isLocalDir(path string) (bool, error) {
@@ -157,7 +137,7 @@ func listLocalFiles(src string, recursive bool) ([]string, error) {
 	return cliutil.ListLocalFiles(src, recursive)
 }
 
-func uploadLocalToS3(ctx context.Context, store *storage.Storage, src, dest *storage.StorageURL, recursive bool, jobs int) error {
+func uploadLocalToS3(ctx context.Context, store *storage.Storage, src, dest *storage.StorageURL, recursive bool, jobs, concurrency int, partSize int64) error {
 	files, err := listLocalFiles(src.Path, recursive)
 	if err != nil {
 		return err
@@ -193,8 +173,11 @@ func uploadLocalToS3(ctx context.Context, store *storage.Storage, src, dest *sto
 		uploadPath := filePath
 		uploadKey := destKey
 		tasks = append(tasks, func() error {
-			_, err := store.UploadFile(ctx, uploadPath, dest.Bucket, uploadKey)
-			return err
+			if _, err := store.UploadFile(ctx, uploadPath, dest.Bucket, uploadKey, concurrency, partSize); err != nil {
+				return err
+			}
+			log.Info(log.InfoMessage{Operation: "put", Source: uploadPath, Destination: "s3://" + dest.Bucket + "/" + uploadKey})
+			return nil
 		})
 	}
 

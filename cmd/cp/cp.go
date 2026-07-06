@@ -1,15 +1,18 @@
 // Package cp implements the `s6cmd cp` command. The cp command structure
-// is SharedFlags + shouldOverride + prepareDownloadTask/
-// prepareUploadTask/prepareCopyTask + countingReaderWriter, and uses cobra
-// + aws-sdk-go-v2 + the s6cmd parallel.Manager/Waiter framework.
+// is SharedFlags + cliutil.TransferSpec (ShouldOverride / Copy / Download /
+// Upload) + countingReaderWriter, and uses cobra + aws-sdk-go-v2 + the
+// s6cmd parallel.Manager/Waiter framework.
 //
-// The command dispatches each source object to one of three do* functions
-// based on the src/dst URL types:
+// The command dispatches each source object to one of three transfer
+// primitives based on the src/dst URL types:
 //
-//	src remote, dst remote   -> doCopy   (server-side CopyObject)
-//	src remote, dst local    -> doDownload (manager.Downloader)
-//	src local,  dst remote   -> doUpload   (manager.Uploader)
+//	src remote, dst remote   -> TransferSpec.Copy   (server-side CopyObject)
+//	src remote, dst local    -> TransferSpec.Download (manager.Downloader)
+//	src local,  dst remote   -> TransferSpec.Upload   (manager.Uploader)
 //	src local,  dst local    -> local copy via the filesystem store
+//
+// The transfer primitives live in internal/cliutil so mv shares the exact
+// same metadata/exclude/concurrency plumbing.
 //
 // Tasks run on the global parallel.Manager; errors are aggregated from the
 // Waiter's error channel and returned as a single errors.Join error so the
@@ -18,11 +21,8 @@ package cp
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/LinPr/s6cmd/internal/cliutil"
 	"github.com/LinPr/s6cmd/internal/errorpkg"
@@ -51,25 +51,22 @@ func NewCpCmd() *cobra.Command {
 			if err := o.validate(); err != nil {
 				return err
 			}
-			ctx := cmd.Context()
-			if o.DryRun {
-				fmt.Fprintf(cmd.OutOrStdout(), "DRYRUN: cp %s %s\n", o.SrcUri, o.DestUri)
-				return nil
-			}
-			return o.run(ctx)
+			return o.run(cmd.Context())
 		},
 	}
 
 	// cp-specific flags. They are not in SharedFlags because mv/sync do
-	// not expose them.
-	cmd.Flags().BoolVarP(&o.DryRun, "dryRun", "n", false, "show what would be transferred")
-	cmd.Flags().BoolVarP(&o.Flatten, "flatten", "f", false, "flatten directory structure of source, starting from the first wildcard")
+	// not expose them. --dry-run keeps -n; --flatten deliberately has no
+	// shorthand (-f is reserved for rb --force, and a fat-fingered -f on a
+	// cp must not silently change key layouts).
+	cmd.Flags().BoolVarP(&o.DryRun, "dry-run", "n", false, "plan the copy and print one line per operation without transferring anything")
+	cmd.Flags().BoolVar(&o.Flatten, "flatten", false, "flatten directory structure of source, starting from the first wildcard")
 	cmd.Flags().BoolVar(&o.NoClobber, "no-clobber", false, "do not overwrite destination if already exists")
 	cmd.Flags().BoolVarP(&o.IfSizeDiffer, "if-size-differ", "s", false, "only overwrite destination if size differs")
 	cmd.Flags().BoolVarP(&o.IfSourceNewer, "if-source-newer", "u", false, "only overwrite destination if source modtime is newer")
 	cmd.Flags().StringVar(&o.VersionID, "version-id", "", "use the specified version of an object")
-	cmd.Flags().BoolVar(&o.ShowProgress, "show-progress", false, "show a progress bar")
-	cmd.Flags().BoolVar(&o.Recursive, "recursive", false, "copy objects recursively (kept for backwards compatibility with prior s6cmd releases)")
+	cmd.Flags().BoolVar(&o.ShowProgress, "show-progress", false, "show a progress bar on stderr (only when stderr is a terminal; applies to uploads/downloads)")
+	cmd.Flags().BoolVar(&o.Recursive, "recursive", false, "copy prefix/bucket/directory sources recursively (required for such sources)")
 
 	// Shared flags: --concurrency, --part-size, --acl, --metadata, ...
 	o.Shared.AddToCmd(&cmd)
@@ -121,6 +118,10 @@ func (o *Options) complete(cmd *cobra.Command, args []string) error {
 		o.DestUri = args[1]
 	}
 	o.CommonFlags = cliutil.LoadParentFlags(cmd)
+	// Propagate --dry-run into the store constructors so every mutating
+	// storage call becomes a no-op while the plan/list/filter phases run
+	// for real.
+	o.CommonFlags.DryRun = o.DryRun
 	return nil
 }
 
@@ -132,6 +133,20 @@ func (o *Options) validate() error {
 		return err
 	}
 	return nil
+}
+
+// spec bundles the per-invocation transfer knobs for cliutil's shared
+// transfer primitives.
+func (o *Options) spec() *cliutil.TransferSpec {
+	return &cliutil.TransferSpec{
+		Op:            "cp",
+		Flatten:       o.Flatten,
+		NoClobber:     o.NoClobber,
+		IfSizeDiffer:  o.IfSizeDiffer,
+		IfSourceNewer: o.IfSourceNewer,
+		DryRun:        o.DryRun,
+		Shared:        o.Shared,
+	}
 }
 
 func (o *Options) run(ctx context.Context) error {
@@ -152,6 +167,15 @@ func (o *Options) run(ctx context.Context) error {
 	// dst must not be a wildcard.
 	if dstURL.IsWildcard() {
 		return fmt.Errorf("target %q can not contain glob characters", o.DestUri)
+	}
+
+	// Multi-object sources require an explicit --recursive (mirroring rm):
+	// a prefix/bucket/directory source expands to every object under it,
+	// and a typo'd cp must not copy an entire prefix by accident. Wildcard
+	// sources stay allowed without the flag — the pattern itself is an
+	// explicit multi-object request.
+	if err := o.checkRecursive(srcURL); err != nil {
+		return err
 	}
 
 	// Pre-compile exclude/include patterns once; isObjectExcluded uses
@@ -181,30 +205,15 @@ func (o *Options) run(ctx context.Context) error {
 	// the size of the source, which is acceptable for the same reason a
 	// single cp invocation is not expected to enumerate millions of
 	// objects (that is what sync is for).
-	objects, err := expandSource(ctx, store, srcURL, !o.Shared.NoFollowSymlinks, o.Recursive)
+	objects, err := cliutil.ExpandSource(ctx, store, srcURL, !o.Shared.NoFollowSymlinks)
 	if err != nil {
 		return err
 	}
 
-	waiter := parallel.NewWaiter()
-	errs := make([]error, 0)
-	errDoneCh := make(chan struct{})
-	go func() {
-		defer close(errDoneCh)
-		for err := range waiter.Err() {
-			if errorpkg.IsCancelation(err) {
-				continue
-			}
-			if errorpkg.IsWarning(err) {
-				log.Debug(log.DebugMessage{Err: err.Error()})
-				continue
-			}
-			log.Error(log.ErrorMessage{Operation: "cp", Err: err.Error()})
-			errs = append(errs, err)
-		}
-	}()
-
-	isBatch := srcURL.IsWildcard()
+	// Resolve isBatch BEFORE starting the drain goroutine: the Stat error
+	// path returns early, and an early return after Drain would leak the
+	// drain goroutine blocked on the waiter's never-closed error channel.
+	isBatch := srcURL.IsWildcard() || (srcURL.IsRemote() && (srcURL.IsBucket() || srcURL.IsPrefix()))
 	if !isBatch && !srcURL.IsRemote() {
 		obj, statErr := store.Stat(ctx, srcURL)
 		if statErr != nil {
@@ -213,19 +222,24 @@ func (o *Options) run(ctx context.Context) error {
 		isBatch = obj != nil && obj.Type.IsDir()
 	}
 
+	// The collector serializes appends from the drain goroutine and the
+	// submission loop below; both used to append to a shared slice, which
+	// was a data race.
+	waiter := parallel.NewWaiter()
+	ec := cliutil.NewErrorCollector("cp")
+	drainDone := ec.Drain(waiter)
+
+	spec := o.spec()
 	for _, object := range objects {
 		if object.Err != nil {
-			errs = append(errs, object.Err)
-			log.Error(log.ErrorMessage{Operation: "cp", Err: object.Err.Error()})
+			ec.Collect(object.Err)
 			continue
 		}
 		if object.Type.IsDir() {
 			continue
 		}
 		if !object.Type.IsRegular() {
-			err := fmt.Errorf("object %v is not a regular file", object)
-			errs = append(errs, err)
-			log.Error(log.ErrorMessage{Operation: "cp", Err: err.Error()})
+			ec.Collect(fmt.Errorf("object %v is not a regular file", object))
 			continue
 		}
 		// Exclude/include filtering uses the relative path so patterns
@@ -244,78 +258,53 @@ func (o *Options) run(ctx context.Context) error {
 		var task parallel.Task
 		switch {
 		case srcURL.IsRemote() && dstURL.IsRemote():
-			task = o.prepareCopyTask(ctx, store, object.StorageURL, dstURL, isBatch)
+			task = prepareCopyTask(ctx, store, spec, object.StorageURL, dstURL, isBatch)
 		case srcURL.IsRemote() && !dstURL.IsRemote():
-			task = o.prepareDownloadTask(ctx, store, object.StorageURL, dstURL, isBatch, pb)
+			task = prepareDownloadTask(ctx, store, spec, object.StorageURL, dstURL, isBatch, pb)
 		case !srcURL.IsRemote() && dstURL.IsRemote():
-			task = o.prepareUploadTask(ctx, store, object.StorageURL, dstURL, isBatch, pb)
+			task = prepareUploadTask(ctx, store, spec, object.StorageURL, dstURL, isBatch, pb)
 		default:
 			// Local->local should have been handled above; guard against
 			// future src/dst type combinations surfacing as silent no-ops.
-			err := fmt.Errorf("unsupported cp pair: src=%v dst=%v", srcURL, dstURL)
-			errs = append(errs, err)
-			log.Error(log.ErrorMessage{Operation: "cp", Err: err.Error()})
+			ec.Collect(fmt.Errorf("unsupported cp pair: src=%v dst=%v", srcURL, dstURL))
 			continue
 		}
 		parallel.Run(task, waiter)
 	}
 	waiter.Wait()
-	<-errDoneCh
+	drainDone()
 
-	return cliutil.AggregateErrors(errs)
+	return ec.Aggregate()
 }
 
-// expandSource materializes the list of source objects. For a single
-// non-wildcard, non-directory source it returns a one-element slice;
-// otherwise it drains the channel returned by storage.List.
-//
-// The function deliberately returns a slice rather than a channel so the
-// caller can iterate it without spawning a second consumer goroutine,
-// which would race with the waiter goroutine on the errs slice.
-func expandSource(ctx context.Context, store *storage.Storage, src *storage.StorageURL, followSymlinks, recursive bool) ([]*storage.Object, error) {
-	// Single object: stat first so we can detect "source is a directory"
-	// (which triggers a walk on the local backend).
-	if !src.IsWildcard() {
-		if !src.IsRemote() {
-			obj, err := store.Stat(ctx, src)
-			if err != nil {
-				return nil, err
-			}
-			if !obj.Type.IsDir() {
-				return []*storage.Object{obj}, nil
-			}
-			// Fall through to List, which walks directories.
-		} else if !src.IsBucket() && !src.IsPrefix() {
-			// Remote single object: List will HEAD/GET it; use it directly.
-			obj, err := store.Stat(ctx, src)
-			if err != nil {
-				return nil, err
-			}
-			return []*storage.Object{obj}, nil
-		}
+// checkRecursive rejects prefix/bucket/directory sources unless
+// --recursive was passed. Wildcard (and --raw) sources are exempt.
+func (o *Options) checkRecursive(srcURL *storage.StorageURL) error {
+	if o.Recursive || srcURL.IsWildcard() {
+		return nil
 	}
-
-	// Prefix / bucket / wildcard / local dir: drain the List channel into
-	// a slice. We collect eagerly because the consumer of the slice (the
-	// task-submission loop) must run on the main goroutine to avoid
-	// racing the errs slice.
-	out := make([]*storage.Object, 0, 64)
-	for obj := range store.List(ctx, src, followSymlinks) {
-		if obj.Err != nil && errorpkg.IsCancelation(obj.Err) {
-			continue
+	if srcURL.IsRemote() {
+		if srcURL.IsBucket() || srcURL.IsPrefix() {
+			return fmt.Errorf("source %q is a bucket/prefix (use --recursive)", o.SrcUri)
 		}
-		out = append(out, obj)
+		return nil
 	}
-	_ = recursive
-	return out, nil
+	isDir, err := cliutil.IsLocalDir(srcURL.Absolute())
+	if err != nil {
+		return err
+	}
+	if isDir {
+		return fmt.Errorf("source %q is a directory (use --recursive)", o.SrcUri)
+	}
+	return nil
 }
 
 // prepareCopyTask builds a server-side copy task (S3 -> S3). It is the
 // only path that honours --metadata-directive.
-func (o *Options) prepareCopyTask(ctx context.Context, store *storage.Storage, srcURL, dstURL *storage.StorageURL, isBatch bool) parallel.Task {
+func prepareCopyTask(ctx context.Context, store *storage.Storage, spec *cliutil.TransferSpec, srcURL, dstURL *storage.StorageURL, isBatch bool) parallel.Task {
 	return func() error {
-		dst := prepareRemoteDestination(srcURL, dstURL, o.Flatten, isBatch)
-		if err := o.doCopy(ctx, store, srcURL, dst); err != nil {
+		dst := cliutil.PrepareRemoteDestination(srcURL, dstURL, spec.Flatten, isBatch)
+		if err := spec.Copy(ctx, store, srcURL, dst); err != nil {
 			return &errorpkg.Error{Op: "cp", Src: srcURL.String(), Dst: dst.String(), Err: err}
 		}
 		return nil
@@ -323,13 +312,13 @@ func (o *Options) prepareCopyTask(ctx context.Context, store *storage.Storage, s
 }
 
 // prepareDownloadTask builds a remote -> local download task.
-func (o *Options) prepareDownloadTask(ctx context.Context, store *storage.Storage, srcURL, dstURL *storage.StorageURL, isBatch bool, pb progressbar.ProgressBar) parallel.Task {
+func prepareDownloadTask(ctx context.Context, store *storage.Storage, spec *cliutil.TransferSpec, srcURL, dstURL *storage.StorageURL, isBatch bool, pb progressbar.ProgressBar) parallel.Task {
 	return func() error {
-		dst, err := prepareLocalDestination(ctx, store, srcURL, dstURL, o.Flatten, isBatch)
+		dst, err := cliutil.PrepareLocalDestination(ctx, store, srcURL, dstURL, spec.Flatten, isBatch)
 		if err != nil {
 			return &errorpkg.Error{Op: "cp", Src: srcURL.String(), Dst: dstURL.String(), Err: err}
 		}
-		if err := o.doDownload(ctx, store, srcURL, dst, pb); err != nil {
+		if err := spec.Download(ctx, store, srcURL, dst, pb); err != nil {
 			return &errorpkg.Error{Op: "cp", Src: srcURL.String(), Dst: dst.String(), Err: err}
 		}
 		return nil
@@ -337,264 +326,14 @@ func (o *Options) prepareDownloadTask(ctx context.Context, store *storage.Storag
 }
 
 // prepareUploadTask builds a local -> remote upload task.
-func (o *Options) prepareUploadTask(ctx context.Context, store *storage.Storage, srcURL, dstURL *storage.StorageURL, isBatch bool, pb progressbar.ProgressBar) parallel.Task {
+func prepareUploadTask(ctx context.Context, store *storage.Storage, spec *cliutil.TransferSpec, srcURL, dstURL *storage.StorageURL, isBatch bool, pb progressbar.ProgressBar) parallel.Task {
 	return func() error {
-		dst := prepareRemoteDestination(srcURL, dstURL, o.Flatten, isBatch)
-		if err := o.doUpload(ctx, store, srcURL, dst, pb); err != nil {
-			return &errorpkg.Error{Op: "cp", Src: srcURL.String(), Dst: dst.String(), Err: err}
+		dst := cliutil.PrepareRemoteDestination(srcURL, dstURL, spec.Flatten, isBatch)
+		if err := spec.Upload(ctx, store, srcURL, dst, pb); err != nil {
+			return &errorpkg.Error{Op: "cp", Src: srcURL.Absolute(), Dst: dst.String(), Err: err}
 		}
 		return nil
 	}
-}
-
-// doCopy performs a server-side CopyObject. Metadata is assembled from the
-// shared flags and the metadata-directive default follows the rule:
-// COPY for local->local (irrelevant here), REPLACE for S3->S3 when the
-// user did not pass a directive explicitly.
-func (o *Options) doCopy(ctx context.Context, store *storage.Storage, srcURL, dstURL *storage.StorageURL) error {
-	directive := o.Shared.MetadataDirective
-	if directive == "" {
-		directive = cliutil.MetadataDirectiveReplace
-	}
-	md := o.sharedMetadata()
-	md.Directive = directive
-
-	if err := o.shouldOverride(ctx, store, srcURL, dstURL); err != nil {
-		if errorpkg.IsWarning(err) {
-			log.Debug(log.DebugMessage{Operation: "cp", Err: err.Error()})
-			return nil
-		}
-		return err
-	}
-
-	if err := store.Copy(ctx, srcURL, dstURL, md); err != nil {
-		return err
-	}
-
-	log.Info(log.InfoMessage{Operation: "cp", Source: srcURL.String(), Destination: dstURL.String()})
-	return nil
-}
-
-// doDownload downloads a remote object to a local file via the multipart
-// downloader. It writes to a temp file in the destination directory and
-// renames on success so a partial download never replaces a complete file.
-func (o *Options) doDownload(ctx context.Context, store *storage.Storage, srcURL, dstURL *storage.StorageURL, pb progressbar.ProgressBar) error {
-	if err := o.shouldOverride(ctx, store, srcURL, dstURL); err != nil {
-		if errorpkg.IsWarning(err) {
-			log.Debug(log.DebugMessage{Operation: "cp", Err: err.Error()})
-			return nil
-		}
-		return err
-	}
-
-	local := localTempStore(store, dstURL)
-	if local == nil {
-		// Fall back to the legacy DownloadFile wrapper when the local
-		// backend does not expose CreateTemp/Rename (it always does in
-		// practice, but we do not want a panic if a mock is plugged in).
-		return store.DownloadFile(ctx, srcURL.Bucket, srcURL.Path, dstURL.Absolute())
-	}
-
-	dstPath := dstURL.Dir()
-	if err := local.MkdirAll(dstPath); err != nil {
-		return err
-	}
-	file, err := local.CreateTemp(dstPath, "s6cmd-")
-	if err != nil {
-		return err
-	}
-	tempPath := file.Name()
-
-	writer := cliutil.NewCountingReaderWriter(file, pb)
-	_, err = store.Get(ctx, srcURL, writer, o.Shared.Concurrency, o.Shared.PartSizeBytes())
-	_ = file.Close()
-	if err != nil {
-		_ = os.Remove(tempPath)
-		return err
-	}
-	if err := local.Rename(tempPath, dstURL.Absolute()); err != nil {
-		_ = os.Remove(tempPath)
-		return err
-	}
-
-	log.Info(log.InfoMessage{Operation: "cp", Source: srcURL.String(), Destination: dstURL.Absolute()})
-	return nil
-}
-
-// doUpload uploads a local file to S3 via the multipart uploader. The
-// content type is guessed from the extension (and the first 512 bytes)
-// when --content-type is not set explicitly.
-func (o *Options) doUpload(ctx context.Context, store *storage.Storage, srcURL, dstURL *storage.StorageURL, pb progressbar.ProgressBar) error {
-	local := localTempStore(store, srcURL)
-	if local == nil {
-		_, err := store.UploadFile(ctx, srcURL.Absolute(), dstURL.Bucket, dstURL.Path)
-		if err == nil {
-			log.Info(log.InfoMessage{Operation: "cp", Source: srcURL.Absolute(), Destination: dstURL.String()})
-		}
-		return err
-	}
-
-	file, err := local.Open(srcURL.Absolute())
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	if err := o.shouldOverride(ctx, store, srcURL, dstURL); err != nil {
-		if errorpkg.IsWarning(err) {
-			log.Debug(log.DebugMessage{Operation: "cp", Err: err.Error()})
-			return nil
-		}
-		return err
-	}
-
-	md := o.sharedMetadata()
-	if md.ContentType == "" {
-		md.ContentType = cliutil.GuessContentType(file)
-	}
-
-	reader := cliutil.NewCountingReaderWriter(file, pb)
-	if err := store.Put(ctx, reader, dstURL, md, o.Shared.Concurrency, o.Shared.PartSizeBytes()); err != nil {
-		return err
-	}
-
-	log.Info(log.InfoMessage{Operation: "cp", Source: srcURL.Absolute(), Destination: dstURL.String()})
-	return nil
-}
-
-// shouldOverride returns nil when the destination should be overwritten,
-// and an errorpkg.ErrObject* sentinel (which is a warning, not a failure)
-// when it should not. The flags --no-clobber / --if-size-differ /
-// --if-source-newer gate the behaviour.
-//
-// The sentinel errors are recognized by errorpkg.IsWarning so the task
-// function can short-circuit without surfacing as a command failure.
-func (o *Options) shouldOverride(ctx context.Context, store *storage.Storage, srcURL, dstURL *storage.StorageURL) error {
-	if !o.NoClobber && !o.IfSizeDiffer && !o.IfSourceNewer {
-		return nil
-	}
-
-	srcObj, err := store.Stat(ctx, srcURL)
-	if err != nil {
-		return err
-	}
-
-	dstObj, err := store.Stat(ctx, dstURL)
-	if err != nil {
-		if errors.Is(err, errorpkg.ErrGivenObjectNotFound) {
-			return nil
-		}
-		return err
-	}
-	if dstObj == nil {
-		return nil
-	}
-
-	var stickyErr error
-	if o.NoClobber {
-		stickyErr = errorpkg.ErrObjectExists
-	}
-	if o.IfSizeDiffer {
-		if srcObj.Size == dstObj.Size {
-			stickyErr = errorpkg.ErrObjectSizesMatch
-		} else {
-			stickyErr = nil
-		}
-	}
-	if o.IfSourceNewer {
-		srcMod := srcObj.ModTime
-		dstMod := dstObj.ModTime
-		if srcMod == nil || dstMod == nil || !srcMod.After(*dstMod) {
-			stickyErr = errorpkg.ErrObjectIsNewer
-		} else {
-			stickyErr = nil
-		}
-	}
-	return stickyErr
-}
-
-// sharedMetadata assembles a storage.Metadata from the SharedFlags. It is
-// the single source of truth for doCopy/doUpload so the metadata fields
-// never drift between the two paths.
-func (o *Options) sharedMetadata() storage.Metadata {
-	return storage.Metadata{
-		UserDefined:        o.Shared.MetadataMap(),
-		ACL:                o.Shared.ACL,
-		CacheControl:       o.Shared.CacheControl,
-		Expires:            o.Shared.Expires,
-		StorageClass:       o.Shared.StorageClass,
-		ContentType:        o.Shared.ContentType,
-		ContentEncoding:    o.Shared.ContentEncoding,
-		ContentDisposition: o.Shared.ContentDisposition,
-		EncryptionMethod:   o.Shared.SSE,
-		EncryptionKeyID:    o.Shared.SSEKMSKeyID,
-	}
-}
-
-// prepareRemoteDestination resolves the destination URL for a remote
-// target: when the dst is a prefix/bucket, the source object's base (or,
-// for batch sources without --flatten, the relative path) is appended.
-func prepareRemoteDestination(srcURL, dstURL *storage.StorageURL, flatten, isBatch bool) *storage.StorageURL {
-	objname := srcURL.Base()
-	if isBatch && !flatten {
-		objname = srcURL.Relative()
-	}
-	if dstURL.IsPrefix() || dstURL.IsBucket() {
-		return dstURL.Join(objname)
-	}
-	return dstURL.Clone()
-}
-
-// prepareLocalDestination resolves the destination URL for a local target:
-// for batch sources the dst is a directory; otherwise a single-file dst
-// may be renamed to the source's base name when it points at a directory.
-func prepareLocalDestination(ctx context.Context, store *storage.Storage, srcURL, dstURL *storage.StorageURL, flatten, isBatch bool) (*storage.StorageURL, error) {
-	objname := srcURL.Base()
-	if isBatch && !flatten {
-		objname = srcURL.Relative()
-	}
-
-	if isBatch {
-		if err := mkdirAllLocal(store, dstURL.Absolute()); err != nil {
-			return nil, err
-		}
-	}
-
-	obj, err := store.Stat(ctx, dstURL)
-	if err != nil && !errors.Is(err, errorpkg.ErrGivenObjectNotFound) {
-		return nil, err
-	}
-	if errors.Is(err, errorpkg.ErrGivenObjectNotFound) {
-		if err := mkdirAllLocal(store, dstURL.Dir()); err != nil {
-			return nil, err
-		}
-		if strings.HasSuffix(dstURL.Absolute(), "/") {
-			return dstURL.Join(objname), nil
-		}
-		return dstURL, nil
-	}
-	if obj != nil && obj.Type.IsDir() {
-		return obj.StorageURL.Join(objname), nil
-	}
-	return dstURL, nil
-}
-
-// mkdirAllLocal is a tiny shim that calls MkdirAll on the local backend
-// when it exposes the method (which *fsstore.FileStore does). Using a
-// type-assertion keeps the storage.Storage surface small.
-func mkdirAllLocal(store *storage.Storage, dir string) error {
-	type mkdirAller interface {
-		MkdirAll(string) error
-	}
-	// Use a local URL so ClientFor dispatches to the filesystem store. We
-	// can't reference the unexported localObject constant from here, so
-	// build the URL from an empty string (NewStorageURL treats a string
-	// with no "://" as a local path).
-	local, _ := storage.NewStorageURL("")
-	if ml, ok := store.ClientFor(local).(mkdirAller); ok {
-		return ml.MkdirAll(dir)
-	}
-	return os.MkdirAll(dir, 0o755)
 }
 
 // copyLocalToLocal handles the local->local case. It walks the source
@@ -621,34 +360,32 @@ func copyLocalToLocal(ctx context.Context, store *storage.Storage, srcURL, dstUR
 	}
 
 	waiter := parallel.NewWaiter()
-	errs := make([]error, 0)
-	errDoneCh := make(chan struct{})
-	go func() {
-		defer close(errDoneCh)
-		for err := range waiter.Err() {
-			if errorpkg.IsCancelation(err) {
-				continue
-			}
-			errs = append(errs, err)
-		}
-	}()
+	ec := cliutil.NewErrorCollector("cp")
+	drainDone := ec.Drain(waiter)
 
+	// Per-file errors are collected instead of returned: an early return
+	// here would leave in-flight copies running after run() has exited
+	// and leak the drain goroutine. Every path falls through to
+	// waiter.Wait() + drainDone() below.
 	for _, file := range files {
 		fileURL, err := storage.NewStorageURL(file)
 		if err != nil {
-			return err
+			ec.Collect(err)
+			continue
 		}
 		var dst string
 		if len(files) > 1 {
 			rel, err := filepath.Rel(srcBase, file)
 			if err != nil {
-				return err
+				ec.Collect(err)
+				continue
 			}
 			dst = filepath.Join(dstURL.Absolute(), filepath.FromSlash(rel))
 		} else {
 			isDir, err := cliutil.IsLocalDir(dstURL.Absolute())
 			if err != nil {
-				return err
+				ec.Collect(err)
+				continue
 			}
 			if isDir {
 				dst = filepath.Join(dstURL.Absolute(), filepath.Base(file))
@@ -671,27 +408,6 @@ func copyLocalToLocal(ctx context.Context, store *storage.Storage, srcURL, dstUR
 		}, waiter)
 	}
 	waiter.Wait()
-	<-errDoneCh
-	return cliutil.AggregateErrors(errs)
-}
-
-// fsStoreWithTemp is the interface the local backend must satisfy for
-// doDownload/doUpload to use the temp-file + rename + counting reader
-// path. It is unexported because it is an internal contract between cp
-// and the filesystem store; callers must not implement it themselves.
-type fsStoreWithTemp interface {
-	CreateTemp(dir, pattern string) (*os.File, error)
-	MkdirAll(path string) error
-	Rename(oldpath, newpath string) error
-	Open(path string) (*os.File, error)
-}
-
-// localTempStore returns the local backend as a fsStoreWithTemp, or nil
-// when the backend does not expose the temp-file methods (in which case
-// doDownload/doUpload fall back to the legacy wrappers).
-func localTempStore(store *storage.Storage, url *storage.StorageURL) fsStoreWithTemp {
-	if ts, ok := store.ClientFor(url).(fsStoreWithTemp); ok {
-		return ts
-	}
-	return nil
+	drainDone()
+	return ec.Aggregate()
 }

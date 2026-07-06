@@ -212,6 +212,37 @@ func TestCopyLocalFile_TargetDirAutoCreated(t *testing.T) {
 	}
 }
 
+// TestCopyLocalFile_FailurePreservesExisting verifies the atomicity of the
+// temp+rename copy: when the copy fails mid-transfer (here, reading from a
+// directory fails with EISDIR), an existing destination file keeps its old
+// content and no s6cmd-* temp file is left behind in the destination dir.
+func TestCopyLocalFile_FailurePreservesExisting(t *testing.T) {
+	t.Parallel()
+	srcDir := t.TempDir() // opening succeeds, io.Copy from it fails
+	dstDir := t.TempDir()
+	dst := filepath.Join(dstDir, "out.txt")
+	if err := os.WriteFile(dst, []byte("precious"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := CopyLocalFile(srcDir, dst); err == nil {
+		t.Fatal("CopyLocalFile succeeded, want read failure on directory source")
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("ReadFile(dst): %v", err)
+	}
+	if string(got) != "precious" {
+		t.Errorf("dst content = %q, want %q (existing file must be untouched)", got, "precious")
+	}
+	leftovers, err := filepath.Glob(filepath.Join(dstDir, "s6cmd-*"))
+	if err != nil {
+		t.Fatalf("Glob: %v", err)
+	}
+	if len(leftovers) != 0 {
+		t.Errorf("temp files left behind after failed copy: %v", leftovers)
+	}
+}
+
 // TestWildcardBasePath verifies the four branches: no wildcard, wildcard in
 // the basename, wildcard mid-path, and a bare wildcard.
 func TestWildcardBasePath(t *testing.T) {
@@ -373,9 +404,8 @@ func TestRunTasks_ConcurrentAllSucceed(t *testing.T) {
 }
 
 // TestRunTasks_ConcurrentErrorReturned verifies that when one or more tasks
-// fail in the concurrent path, RunTasks returns a non-nil error. We do not
-// assert *which* error is returned because the implementation returns the
-// first to arrive on the errCh; we only assert that an error surfaces.
+// fail in the concurrent path, RunTasks returns a non-nil error wrapping
+// the failure.
 func TestRunTasks_ConcurrentErrorReturned(t *testing.T) {
 	t.Parallel()
 	myErr := errors.New("boom")
@@ -390,6 +420,62 @@ func TestRunTasks_ConcurrentErrorReturned(t *testing.T) {
 	}
 	if !errors.Is(err, myErr) {
 		t.Errorf("err = %v, want %v", err, myErr)
+	}
+}
+
+// TestRunTasks_ConcurrentAllErrorsReported verifies that every failing
+// task's error is present in the returned aggregate: the previous
+// implementation had a capacity-1 errCh with a default-drop send, so all
+// but the first error were silently lost.
+func TestRunTasks_ConcurrentAllErrorsReported(t *testing.T) {
+	t.Parallel()
+	const n = 20
+	wantErrs := make([]error, n)
+	tasks := make([]func() error, n)
+	for i := 0; i < n; i++ {
+		wantErrs[i] = errors.New("task " + string(rune('a'+i)) + " failed")
+		err := wantErrs[i]
+		tasks[i] = func() error { return err }
+	}
+	err := RunTasks(4, tasks)
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+	for _, want := range wantErrs {
+		if !errors.Is(err, want) {
+			t.Errorf("aggregate %v is missing %v", err, want)
+		}
+	}
+}
+
+// TestRunTasks_ConcurrentMixedSuccessFailure verifies that a run with both
+// succeeding and failing tasks returns non-nil (the previous select between
+// errCh and done picked randomly and could return nil after a failure) and
+// that every task still runs to completion.
+func TestRunTasks_ConcurrentMixedSuccessFailure(t *testing.T) {
+	t.Parallel()
+	myErr := errors.New("boom")
+	var ran int32
+	tasks := make([]func() error, 0, 40)
+	for i := 0; i < 40; i++ {
+		fail := i%10 == 0
+		tasks = append(tasks, func() error {
+			atomic.AddInt32(&ran, 1)
+			if fail {
+				return myErr
+			}
+			return nil
+		})
+	}
+	err := RunTasks(8, tasks)
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+	if !errors.Is(err, myErr) {
+		t.Errorf("err = %v, want to wrap %v", err, myErr)
+	}
+	if got := atomic.LoadInt32(&ran); got != 40 {
+		t.Errorf("ran %d tasks, want 40 (workers must not stop on first error)", got)
 	}
 }
 

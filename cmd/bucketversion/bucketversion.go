@@ -16,7 +16,6 @@ import (
 	"strings"
 
 	"github.com/LinPr/s6cmd/internal/cliutil"
-	"github.com/LinPr/s6cmd/log"
 	"github.com/LinPr/s6cmd/storage"
 	"github.com/LinPr/s6cmd/strutil"
 	"github.com/go-playground/validator/v10"
@@ -122,7 +121,6 @@ func (o *Options) run(ctx context.Context, out io.Writer) error {
 			return err
 		}
 		msg := bucketVersionMessage{Bucket: src.Bucket, Status: status, IsSet: true}
-		log.Info(msg)
 		fmt.Fprintln(out, msg.String())
 		return nil
 	}
@@ -132,7 +130,6 @@ func (o *Options) run(ctx context.Context, out io.Writer) error {
 		return err
 	}
 	msg := bucketVersionMessage{Bucket: src.Bucket, Status: status, IsSet: false}
-	log.Info(msg)
 	fmt.Fprintln(out, msg.String())
 	return nil
 }

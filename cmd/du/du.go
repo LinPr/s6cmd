@@ -5,11 +5,9 @@ import (
 	"fmt"
 	"io"
 	"sort"
-	"strings"
 
 	"github.com/LinPr/s6cmd/internal/cliutil"
 	"github.com/LinPr/s6cmd/storage"
-	s3store "github.com/LinPr/s6cmd/storage/s3"
 	"github.com/LinPr/s6cmd/strutil"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -33,16 +31,13 @@ func NewDuCmd() *cobra.Command {
 			if err := o.validate(); err != nil {
 				return err
 			}
-			ctx := cmd.Context()
-			if o.DryRun {
-				fmt.Fprintf(cmd.OutOrStdout(), "DRYRUN: du %s\n", o.S3Uri)
-				return nil
-			}
-			return o.run(ctx, cmd.OutOrStdout())
+			return o.run(cmd.Context(), cmd.OutOrStdout())
 		},
 	}
 
-	cmd.Flags().BoolVarP(&o.DryRun, "dryRun", "n", false, "show what would be computed")
+	// du is read-only; --dry-run is accepted for interface consistency
+	// with the mutating commands but has no effect.
+	cmd.Flags().BoolVarP(&o.DryRun, "dry-run", "n", false, "no effect: du is read-only (accepted for consistency)")
 	cmd.Flags().BoolVarP(&o.Humanize, "humanize", "H", false, "human-readable sizes")
 	cmd.Flags().BoolVarP(&o.GroupByClass, "group", "g", false, "group sizes by storage class")
 	cmd.Flags().StringSliceVarP(&o.Exclude, "exclude", "", nil, "exclude objects matching the given wildcard pattern (repeatable)")
@@ -99,19 +94,12 @@ func (o *Options) run(ctx context.Context, out io.Writer) error {
 		return fmt.Errorf("bucket is required")
 	}
 
-	opt := s3store.S3Option{
-		UsePathStyle: o.common.PathStyle,
-		Region:       o.common.Region,
-		Profile:      o.common.Profile,
-		Endpoint:     o.common.EndpointURL,
-		NoVerifySSL:  o.common.NoVerifySSL,
-	}
-	cli, err := s3store.NewS3Client(ctx, opt)
+	cli, err := cliutil.NewS3Client(ctx, o.common)
 	if err != nil {
 		return err
 	}
 
-	excludePatterns, err := compileWildcards(o.Exclude)
+	excludePatterns, err := cliutil.CompileExcludeIncludePatterns(o.Exclude)
 	if err != nil {
 		return err
 	}
@@ -137,7 +125,7 @@ func (o *Options) run(ctx context.Context, out io.Writer) error {
 			if key == prefix {
 				continue
 			}
-			if matchAny(excludePatterns, key) {
+			if cliutil.MatchAnyPattern(excludePatterns, key) {
 				continue
 			}
 			size := aws.ToInt64(obj.Size)
@@ -156,7 +144,13 @@ func (o *Options) run(ctx context.Context, out io.Writer) error {
 		}
 	}
 
+	jsonOutput := o.common.Output == "json"
+
 	if !o.GroupByClass {
+		if jsonOutput {
+			fmt.Fprintln(out, duMessage{Source: o.S3Uri, Count: total.count, Size: total.size}.JSON())
+			return nil
+		}
 		fmt.Fprintln(out, formatSizeLine(o.S3Uri, "", total, o.Humanize))
 		return nil
 	}
@@ -167,10 +161,30 @@ func (o *Options) run(ctx context.Context, out io.Writer) error {
 	}
 	sort.Strings(classes)
 	for _, c := range classes {
+		if jsonOutput {
+			fmt.Fprintln(out, duMessage{
+				Source:       o.S3Uri,
+				Count:        storageTotal[c].count,
+				Size:         storageTotal[c].size,
+				StorageClass: c,
+			}.JSON())
+			continue
+		}
 		fmt.Fprintln(out, formatSizeLine(o.S3Uri, c, storageTotal[c], o.Humanize))
 	}
 	return nil
 }
+
+// duMessage is the per-line JSON payload for du when --output json is set.
+type duMessage struct {
+	Source       string `json:"source"`
+	Count        int64  `json:"count"`
+	Size         int64  `json:"size"`
+	StorageClass string `json:"storage_class,omitempty"`
+}
+
+func (m duMessage) String() string { return m.JSON() }
+func (m duMessage) JSON() string   { return strutil.JSON(m) }
 
 func formatSizeLine(source, class string, sc sizeAndCount, humanize bool) string {
 	var sizeStr string
@@ -183,63 +197,4 @@ func formatSizeLine(source, class string, sc sizeAndCount, humanize bool) string
 		return fmt.Sprintf("%s bytes in %d objects: %s [%s]", sizeStr, sc.count, source, class)
 	}
 	return fmt.Sprintf("%s bytes in %d objects: %s", sizeStr, sc.count, source)
-}
-
-// compileWildcards converts a list of shell wildcard patterns to regex
-// strings. An empty input returns nil with no error.
-func compileWildcards(patterns []string) ([]string, error) {
-	if len(patterns) == 0 {
-		return nil, nil
-	}
-	out := make([]string, 0, len(patterns))
-	for _, p := range patterns {
-		out = append(out, strutil.WildCardToRegexp(p))
-	}
-	return out, nil
-}
-
-// matchAny reports whether key matches any of the precompiled wildcard regex
-// strings. Patterns are anchored to the full key.
-func matchAny(patterns []string, key string) bool {
-	for _, p := range patterns {
-		// re-use strutil helpers for full-match semantics
-		full := strutil.MatchFromStartToEnd(p)
-		if strings.TrimSpace(full) == "" {
-			continue
-		}
-		// We use the simple WildCardToRegexp output; check by regex match.
-		// Avoid importing regexp here — strutil already wraps QuoteMeta.
-		if wildcardMatch(p, key) {
-			return true
-		}
-	}
-	return false
-}
-
-// wildcardMatch does a glob-style match (supports ? and *) without regex.
-// It is a simple iterative matcher sufficient for --exclude patterns.
-func wildcardMatch(pattern, s string) bool {
-	pi, si := 0, 0
-	star := -1
-	ss := 0
-	for si < len(s) {
-		if pi < len(pattern) && (pattern[pi] == '?' || pattern[pi] == s[si]) {
-			pi++
-			si++
-		} else if pi < len(pattern) && pattern[pi] == '*' {
-			star = pi
-			ss = si
-			pi++
-		} else if star != -1 {
-			pi = star + 1
-			ss++
-			si = ss
-		} else {
-			return false
-		}
-	}
-	for pi < len(pattern) && pattern[pi] == '*' {
-		pi++
-	}
-	return pi == len(pattern)
 }

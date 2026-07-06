@@ -2,6 +2,7 @@ package cliutil
 
 import (
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 )
 
@@ -13,8 +14,15 @@ type CommonFlags struct {
 	Profile     string
 	Region      string
 	PathStyle   bool
-	// RetryCount is the --retry-count value (AWS_RETRY_COUNT env). When
-	// non-positive the SDK default retryer is used.
+	// PathStyleSet reports that --path-style was set explicitly (flag,
+	// env or config file). When false and --endpoint-url is set, the S3
+	// client defaults to path-style addressing; an explicit
+	// --path-style=false keeps virtual-host addressing.
+	PathStyleSet bool
+	// RetryCount is the --retry-count value (AWS_RETRY_COUNT env): the
+	// maximum number of attempts per request. When non-positive the SDK's
+	// own retry resolution (AWS_MAX_ATTEMPTS / AWS_RETRY_MODE /
+	// shared-config max_attempts) is kept.
 	RetryCount int
 	// NoSuchUploadRetryCount is the --no-such-upload-retry-count value
 	// (AWS_NO_SUCH_UPLOAD_RETRY_COUNT env). When non-positive Put does
@@ -27,9 +35,19 @@ type CommonFlags struct {
 	// NoSignRequest is the --no-sign-request value (AWS_ANON_BOOL env).
 	// When true the S3 client uses anonymous credentials.
 	NoSignRequest bool
+	// UseListObjectsV1 is the --use-list-objects-v1 value
+	// (S6CMD_USE_LIST_OBJECTS_V1 env). When true the legacy ListObjects API
+	// is used instead of ListObjectsV2.
+	UseListObjectsV1 bool
+	// DryRun makes the stores built from these flags no-op every mutating
+	// operation (Put/Copy/Delete/...). Unlike the fields above it is NOT a
+	// root persistent flag: each command owns its own --dry-run flag and
+	// copies the value here before calling NewStorage/NewS3Client, so
+	// LoadParentFlags never sets it.
+	DryRun bool
 }
 
-// LoadParentFlags reads the shared persistent flags from the parent command
+// LoadParentFlags reads the shared persistent flags from the root command
 // and reconciles them with viper so that config-file and env values are
 // honoured when the user did not pass an explicit --flag.
 //
@@ -48,94 +66,100 @@ type CommonFlags struct {
 // treating a missing key as false.
 func LoadParentFlags(cmd *cobra.Command) CommonFlags {
 	var flags CommonFlags
-	if cmd == nil || cmd.Parent() == nil {
+	if cmd == nil {
 		return flags
 	}
 
-	parentFlags := cmd.Parent().PersistentFlags()
+	// The shared flags live on the ROOT command's PersistentFlags set.
+	// cmd.Parent() is wrong for nested subcommands (`s6cmd select csv ...`
+	// has parent `select`, whose own PersistentFlags set is empty), which
+	// used to silently drop --endpoint-url/--profile/... and send requests
+	// to real AWS. Root() walks up to the top of the tree regardless of
+	// nesting depth.
+	parentFlags := cmd.Root().PersistentFlags()
 	// Root PersistentFlags is the same set viper is bound to, so passing
 	// parentFlags.Lookup(...) values to viper would be redundant; we read
 	// the resolved value via viper.Get* instead.
 
-	if flag := parentFlags.Lookup("endpoint-url"); flag != nil {
-		if flag.Changed {
-			flags.EndpointURL, _ = parentFlags.GetString("endpoint-url")
-		} else {
-			flags.EndpointURL = viper.GetString("endpoint-url")
-		}
-	}
-	if flag := parentFlags.Lookup("no-verify-ssl"); flag != nil {
-		if flag.Changed {
-			flags.NoVerifySSL, _ = parentFlags.GetBool("no-verify-ssl")
-		} else if viper.IsSet("no-verify-ssl") {
-			flags.NoVerifySSL = viper.GetBool("no-verify-ssl")
-		}
-	}
-	if flag := parentFlags.Lookup("no-paginate"); flag != nil {
-		if flag.Changed {
-			flags.NoPaginate, _ = parentFlags.GetBool("no-paginate")
-		} else if viper.IsSet("no-paginate") {
-			flags.NoPaginate = viper.GetBool("no-paginate")
-		}
-	}
-	if flag := parentFlags.Lookup("output"); flag != nil {
-		if flag.Changed {
-			flags.Output, _ = parentFlags.GetString("output")
-		} else if v := viper.GetString("output"); v != "" {
-			flags.Output = v
-		} else {
-			flags.Output, _ = parentFlags.GetString("output")
-		}
-	}
-	if flag := parentFlags.Lookup("profile"); flag != nil {
-		if flag.Changed {
-			flags.Profile, _ = parentFlags.GetString("profile")
-		} else {
-			flags.Profile = viper.GetString("profile")
-		}
-	}
-	if flag := parentFlags.Lookup("region"); flag != nil {
-		if flag.Changed {
-			flags.Region, _ = parentFlags.GetString("region")
-		} else {
-			flags.Region = viper.GetString("region")
-		}
-	}
-	if flag := parentFlags.Lookup("path-style"); flag != nil {
-		if flag.Changed {
-			flags.PathStyle, _ = parentFlags.GetBool("path-style")
-		} else if viper.IsSet("path-style") {
-			flags.PathStyle = viper.GetBool("path-style")
-		}
-	}
-	if flag := parentFlags.Lookup("retry-count"); flag != nil {
-		if flag.Changed {
-			flags.RetryCount, _ = parentFlags.GetInt("retry-count")
-		} else if viper.IsSet("retry-count") {
-			flags.RetryCount = viper.GetInt("retry-count")
-		}
-	}
-	if flag := parentFlags.Lookup("no-such-upload-retry-count"); flag != nil {
-		if flag.Changed {
-			flags.NoSuchUploadRetryCount, _ = parentFlags.GetInt("no-such-upload-retry-count")
-		} else if viper.IsSet("no-such-upload-retry-count") {
-			flags.NoSuchUploadRetryCount = viper.GetInt("no-such-upload-retry-count")
-		}
-	}
-	if flag := parentFlags.Lookup("credentials-file"); flag != nil {
-		if flag.Changed {
-			flags.CredentialsFile, _ = parentFlags.GetString("credentials-file")
-		} else {
-			flags.CredentialsFile = viper.GetString("credentials-file")
-		}
-	}
-	if flag := parentFlags.Lookup("no-sign-request"); flag != nil {
-		if flag.Changed {
-			flags.NoSignRequest, _ = parentFlags.GetBool("no-sign-request")
-		} else if viper.IsSet("no-sign-request") {
-			flags.NoSignRequest = viper.GetBool("no-sign-request")
-		}
-	}
+	ResolveFlags(parentFlags, []FlagBinding{
+		{Name: "endpoint-url", String: &flags.EndpointURL},
+		{Name: "output", String: &flags.Output},
+		{Name: "profile", String: &flags.Profile},
+		{Name: "region", String: &flags.Region},
+		{Name: "credentials-file", String: &flags.CredentialsFile},
+		{Name: "no-verify-ssl", Bool: &flags.NoVerifySSL},
+		{Name: "no-paginate", Bool: &flags.NoPaginate},
+		{Name: "path-style", Bool: &flags.PathStyle, Explicit: &flags.PathStyleSet},
+		{Name: "no-sign-request", Bool: &flags.NoSignRequest},
+		{Name: "use-list-objects-v1", Bool: &flags.UseListObjectsV1},
+		{Name: "retry-count", Int: &flags.RetryCount},
+		{Name: "no-such-upload-retry-count", Int: &flags.NoSuchUploadRetryCount},
+	})
 
 	return flags
+}
+
+// FlagBinding names a flag and the destination its reconciled value should
+// be written to. Exactly one of String/Bool/Int must be set, matching the
+// flag's type.
+type FlagBinding struct {
+	Name   string
+	String *string
+	Bool   *bool
+	Int    *int
+	// Explicit, when non-nil, receives whether the user set the flag
+	// explicitly via any source (command line, environment variable or
+	// config file) as opposed to the cobra default applying. Callers use
+	// it for flags whose default depends on other flags (e.g. --path-style
+	// defaults to true only when --endpoint-url is set).
+	Explicit *bool
+}
+
+// ResolveFlags reconciles each binding's flag with viper and writes the
+// effective value to its destination. Priority per flag (highest first):
+//
+//  1. Explicit --flag on the command line (cobra's Changed bit)
+//  2. Environment variable (bound via viper.BindEnv in cmd/root.go)
+//  3. Config file value (loaded by viper.ReadInConfig)
+//  4. cobra flag default
+//
+// For string flags an empty viper result falls through to the flag value
+// (so the cobra default — e.g. "text" for --output — is preserved when
+// nothing else applies). For bool/int flags viper.IsSet distinguishes "not
+// configured" from a configured zero value. Flags missing from fs leave
+// their destination untouched.
+func ResolveFlags(fs *pflag.FlagSet, bindings []FlagBinding) {
+	for _, b := range bindings {
+		flag := fs.Lookup(b.Name)
+		if flag == nil {
+			continue
+		}
+		if b.Explicit != nil {
+			// The flag was set explicitly when either cobra parsed it from
+			// the command line or viper found it in the environment or the
+			// config file. viper.IsSet skips flag defaults, so an untouched
+			// flag reports false here.
+			*b.Explicit = flag.Changed || viper.IsSet(b.Name)
+		}
+		switch {
+		case b.String != nil:
+			if v := viper.GetString(b.Name); !flag.Changed && v != "" {
+				*b.String = v
+			} else {
+				*b.String, _ = fs.GetString(b.Name)
+			}
+		case b.Bool != nil:
+			if !flag.Changed && viper.IsSet(b.Name) {
+				*b.Bool = viper.GetBool(b.Name)
+			} else {
+				*b.Bool, _ = fs.GetBool(b.Name)
+			}
+		case b.Int != nil:
+			if !flag.Changed && viper.IsSet(b.Name) {
+				*b.Int = viper.GetInt(b.Name)
+			} else {
+				*b.Int, _ = fs.GetInt(b.Name)
+			}
+		}
+	}
 }

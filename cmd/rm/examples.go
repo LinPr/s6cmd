@@ -14,5 +14,5 @@ Example 3: Remove all objects matching a wildcard
 
 Example 4: Dry-run — show what would be removed
 
-         s6cmd rm --dryRun --recursive s3://bucket/prefix/
+         s6cmd rm --dry-run --recursive s3://bucket/prefix/
 `

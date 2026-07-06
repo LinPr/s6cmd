@@ -7,8 +7,8 @@
 #   4. cobra flag default
 #
 # Pass --config /path/to/s6cmd.yaml or set S6CMD_CONFIG to load a different
-# file. With no --config flag, s6cmd searches ~/.s6cmd.yaml, ./config/s6cmd.yaml,
-# and ./s6cmd.yaml in that order.
+# file. With no --config flag, s6cmd looks for $HOME/s6cmd.yaml. The current
+# working directory is deliberately not searched.
 #
 # Every key below mirrors the long flag name; dashes are kept as-is in YAML.
 
@@ -32,11 +32,21 @@ no-verify-ssl: false
 # raw single-page behaviour. Env: AWS_NO_PAGINATE.
 no-paginate: false
 
-# Output format: one of text, json, table. Env: AWS_OUTPUT.
+# Output format: one of text, json. Env: AWS_OUTPUT.
 output: text
 
-# Force path-style addressing (https://endpoint/bucket/key rather than the
-# virtual-host form https://bucket.endpoint/key). Required by most
-# S3-compatible services (MinIO, OSS, COS, GCS). Default false uses
-# virtual-host, which is the AWS S3 default. Env: S6CMD_USE_PATH_STYLE.
-path-style: false
+# Log level: one of trace, debug, info, error. Env: S6CMD_LOG.
+log: info
+
+# Collect per-operation statistics and print a summary table when the
+# command finishes. Env: S6CMD_STAT.
+stat: false
+
+# Path-style addressing (https://endpoint/bucket/key rather than the
+# virtual-host form https://bucket.endpoint/key). When this key is NOT set
+# anywhere (flag/env/config), s6cmd defaults to path-style whenever a custom
+# endpoint-url is configured (MinIO, OSS, COS, GCS need it) and to the AWS
+# virtual-host default otherwise. Setting the key — true or false — pins the
+# style explicitly; e.g. `path-style: false` keeps virtual-host addressing on
+# a custom endpoint that supports it. Env: S6CMD_USE_PATH_STYLE.
+# path-style: false

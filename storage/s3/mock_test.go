@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -54,6 +55,19 @@ type mockS3 struct {
 	// newMockS3Server so putTestObject can reach the mock without the
 	// caller having to thread the *httptest.Server around.
 	srvURL string
+
+	// listMaxKeys, when > 0, caps the number of Contents entries per
+	// ListObjects (V1) page so tests can force pagination. V1 responses
+	// mimic real S3: NextMarker is only emitted when a delimiter was
+	// supplied, so clients must fall back to the last Contents key.
+	listMaxKeys int
+
+	// listV1NonAdvancing, when true, makes the V1 handler misbehave: the
+	// incoming marker is ignored (the same page is re-emitted on every
+	// request) and IsTruncated is always reported. This simulates a broken
+	// S3-compatible server whose marker never advances, which would loop a
+	// naive client forever.
+	listV1NonAdvancing bool
 }
 
 // mockMultipart is a single in-flight multipart upload.
@@ -111,10 +125,14 @@ func (m *mockS3) bucketFromRequest(r *http.Request) string {
 }
 
 // recordRequest appends a one-line summary of the request to m.requests.
-// The format is "METHOD path host=<Host>".
+// The format is "METHOD path[?query] host=<Host>".
 func (m *mockS3) recordRequest(r *http.Request) {
+	uri := r.URL.Path
+	if r.URL.RawQuery != "" {
+		uri += "?" + r.URL.RawQuery
+	}
 	m.mu.Lock()
-	m.requests = append(m.requests, fmt.Sprintf("%s %s host=%s", r.Method, r.URL.Path, r.Host))
+	m.requests = append(m.requests, fmt.Sprintf("%s %s host=%s", r.Method, uri, r.Host))
 	m.mu.Unlock()
 }
 
@@ -156,7 +174,9 @@ func (m *mockS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case key == "" && q.Has("list-type"):
 			m.handleListObjectsV2(w, r, bucket)
 		case key == "":
-			m.handleListObjectsV2(w, r, bucket) // bare GET /bucket defaults to V2
+			// The SDK's V2 ListObjects always sends list-type=2, so a bare
+			// GET /bucket is the legacy ListObjects (V1) shape.
+			m.handleListObjectsV1(w, r, bucket)
 		default:
 			m.handleGetObject(w, r, bucket, key)
 		}
@@ -202,7 +222,7 @@ func (m *mockS3) handleListBuckets(w http.ResponseWriter, r *http.Request) {
 		CreationDate string `xml:"CreationDate"`
 	}
 	type result struct {
-		XMLName xml.Name   `xml:"ListAllMyBucketsResult"`
+		XMLName xml.Name    `xml:"ListAllMyBucketsResult"`
 		Buckets []bucketXML `xml:"Buckets>Bucket"`
 	}
 
@@ -287,13 +307,13 @@ func (m *mockS3) handleListObjectsV2(w http.ResponseWriter, r *http.Request, buc
 		Prefix string `xml:"Prefix"`
 	}
 	type result struct {
-		XMLName        xml.Name         `xml:"ListBucketResult"`
-		Name           string           `xml:"Name"`
-		Prefix         string           `xml:"Prefix"`
-		Delimiter      string           `xml:"Delimiter,omitempty"`
-		IsTruncated    bool             `xml:"IsTruncated"`
-		KeyCount       int              `xml:"KeyCount"`
-		Contents       []contentXML     `xml:"Contents"`
+		XMLName        xml.Name          `xml:"ListBucketResult"`
+		Name           string            `xml:"Name"`
+		Prefix         string            `xml:"Prefix"`
+		Delimiter      string            `xml:"Delimiter,omitempty"`
+		IsTruncated    bool              `xml:"IsTruncated"`
+		KeyCount       int               `xml:"KeyCount"`
+		Contents       []contentXML      `xml:"Contents"`
 		CommonPrefixes []commonPrefixXML `xml:"CommonPrefixes"`
 	}
 
@@ -335,6 +355,102 @@ func (m *mockS3) handleListObjectsV2(w http.ResponseWriter, r *http.Request, buc
 		return res.CommonPrefixes[i].Prefix < res.CommonPrefixes[j].Prefix
 	})
 	res.KeyCount = len(res.Contents) + len(res.CommonPrefixes)
+	writeXML(w, http.StatusOK, res)
+}
+
+// --- ListObjects (V1) ---
+
+// handleListObjectsV1 implements the legacy ListObjects API with marker
+// pagination. When m.listMaxKeys is set, at most that many Contents entries
+// are returned per page and IsTruncated signals more data. Matching real S3,
+// NextMarker is only included when the request supplied a delimiter — for
+// delimiter-less requests the client must use the last Contents key as the
+// next Marker.
+func (m *mockS3) handleListObjectsV1(w http.ResponseWriter, r *http.Request, bucket string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, ok := m.buckets[bucket]; !ok {
+		writeS3Error(w, http.StatusNotFound, "NoSuchBucket", "bucket does not exist")
+		return
+	}
+
+	prefix := r.URL.Query().Get("prefix")
+	delimiter := r.URL.Query().Get("delimiter")
+	marker := r.URL.Query().Get("marker")
+
+	type contentXML struct {
+		Key          string `xml:"Key"`
+		LastModified string `xml:"LastModified"`
+		ETag         string `xml:"ETag"`
+		Size         int64  `xml:"Size"`
+		StorageClass string `xml:"StorageClass"`
+	}
+	type commonPrefixXML struct {
+		Prefix string `xml:"Prefix"`
+	}
+	type result struct {
+		XMLName        xml.Name          `xml:"ListBucketResult"`
+		Name           string            `xml:"Name"`
+		Prefix         string            `xml:"Prefix"`
+		Marker         string            `xml:"Marker"`
+		NextMarker     string            `xml:"NextMarker,omitempty"`
+		Delimiter      string            `xml:"Delimiter,omitempty"`
+		IsTruncated    bool              `xml:"IsTruncated"`
+		Contents       []contentXML      `xml:"Contents"`
+		CommonPrefixes []commonPrefixXML `xml:"CommonPrefixes"`
+	}
+
+	res := result{Name: bucket, Prefix: prefix, Marker: marker, Delimiter: delimiter}
+	objs := m.objects[bucket]
+	keys := make([]string, 0, len(objs))
+	for k := range objs {
+		if prefix != "" && !strings.HasPrefix(k, prefix) {
+			continue
+		}
+		// A non-advancing server re-emits the same page regardless of the
+		// requested marker.
+		if !m.listV1NonAdvancing && marker != "" && k <= marker {
+			continue
+		}
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	common := map[string]struct{}{}
+	for _, k := range keys {
+		if m.listMaxKeys > 0 && len(res.Contents) == m.listMaxKeys {
+			res.IsTruncated = true
+			if delimiter != "" && len(res.Contents) > 0 {
+				res.NextMarker = res.Contents[len(res.Contents)-1].Key
+			}
+			break
+		}
+		if delimiter != "" {
+			rest := strings.TrimPrefix(k, prefix)
+			if idx := strings.Index(rest, delimiter); idx >= 0 {
+				common[prefix+rest[:idx+1]] = struct{}{}
+				continue
+			}
+		}
+		res.Contents = append(res.Contents, contentXML{
+			Key:          k,
+			LastModified: m.modTime[bucket][k].UTC().Format(time.RFC3339),
+			ETag:         fmt.Sprintf(`"%x"`, md5.Sum(objs[k])),
+			Size:         int64(len(objs[k])),
+			StorageClass: "STANDARD",
+		})
+	}
+	for cp := range common {
+		res.CommonPrefixes = append(res.CommonPrefixes, commonPrefixXML{Prefix: cp})
+	}
+	sort.Slice(res.CommonPrefixes, func(i, j int) bool {
+		return res.CommonPrefixes[i].Prefix < res.CommonPrefixes[j].Prefix
+	})
+	if m.listV1NonAdvancing {
+		res.IsTruncated = true
+		res.NextMarker = ""
+	}
 	writeXML(w, http.StatusOK, res)
 }
 
@@ -526,6 +642,16 @@ func (m *mockS3) handlePutObject(w http.ResponseWriter, r *http.Request, bucket,
 
 func (m *mockS3) handleCopyObject(w http.ResponseWriter, r *http.Request, dstBucket, dstKey, copySource string) {
 	src := strings.TrimPrefix(copySource, "/")
+	// The copy source may carry a "?versionId=<id>" subresource; the mock is
+	// unversioned, so it is stripped after decoding.
+	if idx := strings.IndexByte(src, '?'); idx >= 0 {
+		src = src[:idx]
+	}
+	// CopySource is percent-encoded per path segment; decode it so keys with
+	// spaces and other reserved characters resolve to the stored key.
+	if decoded, err := url.PathUnescape(src); err == nil {
+		src = decoded
+	}
 	srcBucket, srcKey, ok := splitBucketKey(src)
 	if !ok {
 		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "bad copy-source")
@@ -648,13 +774,13 @@ func (m *mockS3) handleDeleteObjects(w http.ResponseWriter, r *http.Request, buc
 			delete(m.metadata[bucket], o.Key)
 			delete(m.contentType[bucket], o.Key)
 			delete(m.modTime[bucket], o.Key)
-			// The SDK uses Quiet=true, so it does NOT parse <Deleted>
-			// entries — only <Error> entries are surfaced. To make the
-			// success path observable to MultiDelete's result channel
-			// (which iterates output.Deleted), we emit one <Deleted>
-			// entry per key regardless of Quiet. The SDK ignores the
-			// extra entries when Quiet was requested.
-			res.Deleted = append(res.Deleted, deleted{Key: o.Key})
+			// Matching real S3, Quiet suppresses the <Deleted> entries so
+			// only <Error> entries appear in a quiet response. MultiDelete
+			// derives its successes from the request's key set, so it must
+			// not depend on <Deleted> being present.
+			if !req.Quiet {
+				res.Deleted = append(res.Deleted, deleted{Key: o.Key})
+			}
 		}
 	} else {
 		// Bucket missing — report errors per key.
@@ -829,8 +955,15 @@ func newS3Store(t *testing.T, srv *httptest.Server, opts ...func(*S3Option)) *S3
 // HTTP API. It is used to seed fixtures without going through the SDK.
 func (m *mockS3) putTestObject(t *testing.T, bucket, key string, content []byte, metadata map[string]string) {
 	t.Helper()
-	url := fmt.Sprintf("%s/%s/%s", m.serverURL(), bucket, key)
-	req, err := http.NewRequest(http.MethodPut, url, bytes.NewReader(content))
+	// Percent-encode each key segment so keys with spaces (or other
+	// reserved characters) form a valid request URL; the server decodes
+	// the path back to the raw key.
+	segments := strings.Split(key, "/")
+	for i, s := range segments {
+		segments[i] = url.PathEscape(s)
+	}
+	reqURL := fmt.Sprintf("%s/%s/%s", m.serverURL(), bucket, strings.Join(segments, "/"))
+	req, err := http.NewRequest(http.MethodPut, reqURL, bytes.NewReader(content))
 	if err != nil {
 		t.Fatalf("putTestObject: %v", err)
 	}

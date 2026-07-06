@@ -550,6 +550,55 @@ func TestMultiDelete_Batch(t *testing.T) {
 	}
 }
 
+// TestMultiDelete_DryRun verifies the dry-run branch: every URL is echoed
+// back as a successful result (with its version id preserved) without any
+// DeleteObjects request reaching the server, and URLs whose reconstruction
+// fails do not panic (the branch guards the nil URL like its siblings).
+func TestMultiDelete_DryRun(t *testing.T) {
+	t.Parallel()
+	srv, backend := newMockS3Server(t)
+	store := newS3Store(t, srv, func(o *S3Option) { o.DryRun = true })
+
+	const bucket = "multidel-dry"
+	backend.makeBucket(t, bucket)
+	backend.putTestObject(t, bucket, "keep.txt", []byte("x"), nil)
+
+	u, err := storage.NewStorageURL("s3://"+bucket+"/keep.txt", storage.WithVersion("v-1"))
+	if err != nil {
+		t.Fatalf("NewStorageURL: %v", err)
+	}
+	urls := make(chan *storage.StorageURL, 1)
+	urls <- u
+	close(urls)
+
+	var results []*storage.Object
+	for o := range store.MultiDelete(context.Background(), urls) {
+		if o == nil {
+			continue
+		}
+		if o.Err != nil {
+			t.Fatalf("dry-run MultiDelete: unexpected error: %v", o.Err)
+		}
+		results = append(results, o)
+	}
+	if len(results) != 1 {
+		t.Fatalf("dry-run MultiDelete: want 1 result, got %d", len(results))
+	}
+	if got := results[0].StorageURL.VersionID; got != "v-1" {
+		t.Errorf("dry-run MultiDelete: version id not preserved, got %q", got)
+	}
+	if _, ok := backend.objects[bucket]["keep.txt"]; !ok {
+		t.Fatalf("dry-run MultiDelete must not delete the object")
+	}
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	for _, r := range backend.requests {
+		if strings.HasPrefix(r, "POST /"+bucket+"?") && strings.Contains(r, "delete") {
+			t.Fatalf("dry-run MultiDelete must not issue requests, got %q", r)
+		}
+	}
+}
+
 // TestMultiDelete_Empty verifies MultiDelete on an empty URL channel does
 // not block or error.
 func TestMultiDelete_Empty(t *testing.T) {
@@ -584,8 +633,12 @@ func TestMultiDelete_Empty(t *testing.T) {
 // provider via the environment — the mock server ignores the Authorization
 // header, so any signature value is acceptable.
 func TestPresign(t *testing.T) {
-	// t.Setenv cannot be used with t.Parallel, so this test is not
-	// parallel.
+	// isolateAWSEnv uses t.Setenv, which cannot be used with t.Parallel,
+	// so this test is not parallel. It points the shared config/credentials
+	// files at nonexistent paths and blanks the ambient AWS_* env vars
+	// (AWS_SDK_LOAD_CONFIG is ignored by SDK v2, so it must not be relied
+	// on for isolation).
+	isolateAWSEnv(t)
 
 	// The SDK config loader reads AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
 	// from the environment. Set fake values for the duration of the test so
@@ -593,13 +646,11 @@ func TestPresign(t *testing.T) {
 	// user's shared credentials file.
 	t.Setenv("AWS_ACCESS_KEY_ID", "presign-test-key")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "presign-test-secret")
-	// Ensure no shared-config file is loaded.
-	t.Setenv("AWS_SDK_LOAD_CONFIG", "0")
 
 	srv, backend := newMockS3Server(t)
 	store, err := NewS3Client(context.Background(), S3Option{
-		Endpoint:      srv.URL,
-		UsePathStyle:  true,
+		Endpoint:     srv.URL,
+		UsePathStyle: true,
 		// NoSignRequest left false so the SDK installs the SigV4 signer
 		// that Presign needs. The mock server ignores Authorization.
 		Region:     "us-east-1",
@@ -687,24 +738,28 @@ func TestNewS3Client_PathStyle(t *testing.T) {
 	}
 }
 
-// TestNewS3Client_VirtualHostStyle asserts the SDK leaves UsePathStyle=false
-// when the option is unset. Because NewS3Client sets HostnameImmutable=true
-// on the custom endpoint resolver (to keep the SDK from rewriting the host
-// for S3-compatible services), the SDK keeps the mock server's host as-is
-// and the bucket stays in the URL path. We therefore cannot assert the Host
-// header directly on a custom endpoint; instead we verify the addressing
-// decision: the resulting client's UsePathStyle option is false, which is
-// the load-bearing assertion (it means the SDK would rewrite Host to
-// "<bucket>.<host>" if the endpoint resolver had not pinned the hostname).
+// TestNewS3Client_VirtualHostStyle pins the two virtual-host outcomes of
+// the addressing policy at the client-option level:
 //
-// The full virtual-host request shape (bucket-prefixed Host) is exercised
-// end-to-end in the e2e suite against a real gofakes3 server; here we pin
-// the decision logic.
+//   - no custom endpoint + flag unset → the SDK default (virtual-host,
+//     UsePathStyle=false);
+//   - custom endpoint + EXPLICIT --path-style=false → virtual-host is kept
+//     for services that support it (e.g. Aliyun OSS).
+//
+// A custom endpoint with the flag unset defaults to path-style — see
+// TestNewS3Client_AddressingPolicy. The actual on-the-wire request shape
+// (bucket-prefixed Host header vs. bucket-in-path) is asserted in
+// TestNewS3Client_AddressingRequestShape with a hostname endpoint and a
+// capturing HTTP client; it is NOT covered by the e2e suite, which always
+// runs path-style against gofakes3.
 func TestNewS3Client_VirtualHostStyle(t *testing.T) {
-	t.Parallel()
+	// isolateAWSEnv uses t.Setenv, so no t.Parallel: the "no custom
+	// endpoint" case must not pick up an ambient AWS_ENDPOINT_URL_S3.
+	isolateAWSEnv(t)
 	srv, _ := newMockS3Server(t)
+
+	// No custom endpoint, flag unset: SDK default (virtual-host).
 	store, err := NewS3Client(context.Background(), S3Option{
-		Endpoint:      srv.URL,
 		NoSignRequest: true,
 		Region:        "us-east-1",
 		MaxRetries:    1,
@@ -713,35 +768,59 @@ func TestNewS3Client_VirtualHostStyle(t *testing.T) {
 		t.Fatalf("NewS3Client: %v", err)
 	}
 	if got := store.Client().Options().UsePathStyle; got {
-		t.Fatalf("VirtualHost: UsePathStyle should be false, got true")
+		t.Fatalf("no endpoint + flag unset: UsePathStyle should be false, got true")
+	}
+
+	// Custom endpoint + explicit --path-style=false: virtual-host is kept.
+	store, err = NewS3Client(context.Background(), S3Option{
+		Endpoint:          srv.URL,
+		UsePathStyle:      false,
+		PathStyleExplicit: true,
+		NoSignRequest:     true,
+		Region:            "us-east-1",
+		MaxRetries:        1,
+	})
+	if err != nil {
+		t.Fatalf("NewS3Client: %v", err)
+	}
+	if got := store.Client().Options().UsePathStyle; got {
+		t.Fatalf("custom endpoint + explicit false: UsePathStyle should be false, got true")
 	}
 }
 
-// TestNewS3Client_UsePathStyle_Passthrough pins that NewS3Client forwards
-// option.UsePathStyle to the SDK client verbatim, regardless of endpoint.
-func TestNewS3Client_UsePathStyle_Passthrough(t *testing.T) {
-	t.Parallel()
+// TestNewS3Client_AddressingPolicy pins the full addressing policy matrix:
+// an explicit --path-style (true or false) always wins; an unset flag
+// defaults to path-style when a custom endpoint is configured (the s5cmd/mc
+// behaviour — MinIO-style named endpoints do not resolve bucket-prefixed
+// hostnames) and to the SDK default (virtual-host) otherwise.
+func TestNewS3Client_AddressingPolicy(t *testing.T) {
+	// isolateAWSEnv uses t.Setenv, so neither this test nor its subtests
+	// are parallel.
+	isolateAWSEnv(t)
 
 	cases := []struct {
 		name      string
 		endpoint  string
 		pathStyle bool
+		explicit  bool
 		wantPath  bool
 	}{
 		{name: "default-virtual", endpoint: "", pathStyle: false, wantPath: false},
-		{name: "explicit-path-custom", endpoint: "http://127.0.0.1:9000", pathStyle: true, wantPath: true},
-		{name: "explicit-virtual-custom", endpoint: "http://127.0.0.1:9000", pathStyle: false, wantPath: false},
+		{name: "custom-endpoint-flag-unset-defaults-to-path", endpoint: "http://127.0.0.1:9000", pathStyle: false, wantPath: true},
+		{name: "explicit-path-custom", endpoint: "http://127.0.0.1:9000", pathStyle: true, explicit: true, wantPath: true},
+		{name: "explicit-virtual-custom", endpoint: "http://127.0.0.1:9000", pathStyle: false, explicit: true, wantPath: false},
 		{name: "path-default-endpoint", endpoint: "", pathStyle: true, wantPath: true},
+		{name: "explicit-path-default-endpoint", endpoint: "", pathStyle: true, explicit: true, wantPath: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
 			opt := S3Option{
-				Endpoint:      tc.endpoint,
-				UsePathStyle:  tc.pathStyle,
-				NoSignRequest: true,
-				Region:        "us-east-1",
-				MaxRetries:    1,
+				Endpoint:          tc.endpoint,
+				UsePathStyle:      tc.pathStyle,
+				PathStyleExplicit: tc.explicit,
+				NoSignRequest:     true,
+				Region:            "us-east-1",
+				MaxRetries:        1,
 			}
 			store, err := NewS3Client(context.Background(), opt)
 			if err != nil {

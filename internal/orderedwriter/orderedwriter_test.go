@@ -5,6 +5,7 @@ package orderedwriter_test
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"math/rand"
 	"sync"
@@ -304,5 +305,176 @@ func TestBufferWithChangingSlice(t *testing.T) {
 				t.Errorf("output mismatch (run %d): got %d bytes, want %d", r, result.Len(), len(expected))
 			}
 		})
+	}
+}
+
+// flakyWriter fails the first failures writes with a transient error after
+// consuming partialN bytes, mimicking a destination that accepts part of a
+// chunk before erroring. Subsequent writes succeed.
+type flakyWriter struct {
+	buf      bytes.Buffer
+	failures int
+	partialN int
+}
+
+func (f *flakyWriter) Write(p []byte) (int, error) {
+	if f.failures > 0 {
+		f.failures--
+		n := f.partialN
+		if n > len(p) {
+			n = len(p)
+		}
+		f.buf.Write(p[:n])
+		return n, errors.New("transient write failure")
+	}
+	return f.buf.Write(p)
+}
+
+// TestDuplicateFlushedChunk verifies that re-issuing a chunk that was
+// already flushed (an SDK part retry) is dropped instead of stalling the
+// flush loop: before the watermark check was added, the stale chunk sat at
+// the front of the list forever and output silently stopped.
+func TestDuplicateFlushedChunk(t *testing.T) {
+	t.Parallel()
+	var result bytes.Buffer
+	w := orderedwriter.New(&result)
+
+	if _, err := w.WriteAt([]byte("abc"), 0); err != nil {
+		t.Fatalf("WriteAt(abc,0): %v", err)
+	}
+	// Retry of the already-flushed part: must be accepted and dropped.
+	if n, err := w.WriteAt([]byte("abc"), 0); err != nil {
+		t.Fatalf("WriteAt(abc,0) retry: %v", err)
+	} else if n != 3 {
+		t.Errorf("retry WriteAt returned %d, want 3", n)
+	}
+	// The stream must keep flowing after the duplicate.
+	if _, err := w.WriteAt([]byte("def"), 3); err != nil {
+		t.Fatalf("WriteAt(def,3): %v", err)
+	}
+	if got := result.String(); got != "abcdef" {
+		t.Errorf("result = %q, want %q", got, "abcdef")
+	}
+}
+
+// TestDuplicateBufferedChunk verifies that a duplicate of a still-buffered
+// (out-of-order) chunk is flushed exactly once.
+func TestDuplicateBufferedChunk(t *testing.T) {
+	t.Parallel()
+	var result bytes.Buffer
+	w := orderedwriter.New(&result)
+
+	if _, err := w.WriteAt([]byte("B"), 1); err != nil {
+		t.Fatalf("WriteAt(B,1): %v", err)
+	}
+	if _, err := w.WriteAt([]byte("B"), 1); err != nil {
+		t.Fatalf("WriteAt(B,1) duplicate: %v", err)
+	}
+	if _, err := w.WriteAt([]byte("A"), 0); err != nil {
+		t.Fatalf("WriteAt(A,0): %v", err)
+	}
+	if got := result.String(); got != "AB" {
+		t.Errorf("result = %q, want %q", got, "AB")
+	}
+	// The stream must continue at the right offset after the duplicate
+	// was discarded.
+	if _, err := w.WriteAt([]byte("C"), 2); err != nil {
+		t.Fatalf("WriteAt(C,2): %v", err)
+	}
+	if got := result.String(); got != "ABC" {
+		t.Errorf("result = %q, want %q", got, "ABC")
+	}
+}
+
+// TestOverlapStraddlingWatermark verifies that a chunk that overlaps the
+// already-written prefix is trimmed, not re-written.
+func TestOverlapStraddlingWatermark(t *testing.T) {
+	t.Parallel()
+	var result bytes.Buffer
+	w := orderedwriter.New(&result)
+
+	if _, err := w.WriteAt([]byte("abcd"), 0); err != nil {
+		t.Fatalf("WriteAt(abcd,0): %v", err)
+	}
+	// Overlaps [2,4) which is already written; only "ef" must land.
+	if n, err := w.WriteAt([]byte("cdef"), 2); err != nil {
+		t.Fatalf("WriteAt(cdef,2): %v", err)
+	} else if n != 4 {
+		t.Errorf("WriteAt(cdef,2) returned %d, want 4", n)
+	}
+	if got := result.String(); got != "abcdef" {
+		t.Errorf("result = %q, want %q", got, "abcdef")
+	}
+}
+
+// TestBufferedOverlapTrimmedAtFlush verifies that a buffered chunk whose
+// range is partially consumed by the time it reaches the front of the list
+// is trimmed against the watermark during the flush sweep.
+func TestBufferedOverlapTrimmedAtFlush(t *testing.T) {
+	t.Parallel()
+	var result bytes.Buffer
+	w := orderedwriter.New(&result)
+
+	// Buffer an out-of-order chunk overlapping [2,6).
+	if _, err := w.WriteAt([]byte("cdef"), 2); err != nil {
+		t.Fatalf("WriteAt(cdef,2): %v", err)
+	}
+	// Now write [0,4): flushes straight through and overtakes the front
+	// half of the buffered chunk, which must be trimmed to "ef".
+	if _, err := w.WriteAt([]byte("abcd"), 0); err != nil {
+		t.Fatalf("WriteAt(abcd,0): %v", err)
+	}
+	if got := result.String(); got != "abcdef" {
+		t.Errorf("result = %q, want %q", got, "abcdef")
+	}
+}
+
+// TestRetryAfterFastPathError verifies the retry contract on the fast
+// path: when the underlying writer consumes part of the chunk and errors,
+// the watermark advances past the consumed bytes, so the SDK's retried
+// WriteAt resumes exactly at the watermark and cannot double-write.
+func TestRetryAfterFastPathError(t *testing.T) {
+	t.Parallel()
+	fw := &flakyWriter{failures: 1, partialN: 2}
+	w := orderedwriter.New(fw)
+
+	if _, err := w.WriteAt([]byte("hello"), 0); err == nil {
+		t.Fatalf("WriteAt(hello,0): expected transient error, got nil")
+	}
+	// SDK retry re-issues the whole part.
+	if _, err := w.WriteAt([]byte("hello"), 0); err != nil {
+		t.Fatalf("WriteAt(hello,0) retry: %v", err)
+	}
+	if _, err := w.WriteAt([]byte("world"), 5); err != nil {
+		t.Fatalf("WriteAt(world,5): %v", err)
+	}
+	if got := fw.buf.String(); got != "helloworld" {
+		t.Errorf("result = %q, want %q", got, "helloworld")
+	}
+}
+
+// TestRetryAfterBufferedFlushError verifies the retry contract on the
+// buffered path: a mid-flush partial write + error leaves the failed chunk
+// truncated to its unwritten tail, so retrying both parts produces the
+// stream exactly once.
+func TestRetryAfterBufferedFlushError(t *testing.T) {
+	t.Parallel()
+	fw := &flakyWriter{failures: 1, partialN: 2}
+	w := orderedwriter.New(fw)
+
+	// Buffer the second part so the first goes through the flush loop.
+	if _, err := w.WriteAt([]byte("world"), 5); err != nil {
+		t.Fatalf("WriteAt(world,5): %v", err)
+	}
+	if _, err := w.WriteAt([]byte("hello"), 0); err == nil {
+		t.Fatalf("WriteAt(hello,0): expected transient error, got nil")
+	}
+	// SDK retry of the failed part: the consumed prefix must be dropped
+	// and the remainder must flush, pulling the buffered part with it.
+	if _, err := w.WriteAt([]byte("hello"), 0); err != nil {
+		t.Fatalf("WriteAt(hello,0) retry: %v", err)
+	}
+	if got := fw.buf.String(); got != "helloworld" {
+		t.Errorf("result = %q, want %q", got, "helloworld")
 	}
 }

@@ -60,8 +60,7 @@ func TestE2E_DuPrefix(t *testing.T) {
 }
 
 // TestE2E_DuHumanize verifies that --humanize/-H produces a human-readable
-// size string. HumanizeBytes uses a strict > comparison, so 1024 bytes
-// (exactly 1K) is reported as "1024"; we use 2048 to land in the K range.
+// size string.
 func TestE2E_DuHumanize(t *testing.T) {
 	t.Parallel()
 	endpoint := s3ServerEndpoint(t)
@@ -69,7 +68,7 @@ func TestE2E_DuHumanize(t *testing.T) {
 	bucket := s3BucketFromTestName(t)
 	createBucket(t, client, bucket)
 
-	// 2048 bytes -> "2.0K" (strict > means 1024 itself stays as bytes).
+	// 2048 bytes -> "2.0K".
 	big := strings.Repeat("x", 2048)
 	putObject(t, client, bucket, "big.txt", big)
 

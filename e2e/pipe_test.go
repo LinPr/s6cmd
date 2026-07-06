@@ -1,38 +1,18 @@
 package e2e
 
 import (
-	"bytes"
-	"os/exec"
-	"strings"
 	"testing"
 )
 
 // runS6cmdWithStdin runs the s6cmd binary with the given stdin and args.
+// It routes through runS6cmdRawStdin so the hardened e2e environment
+// (blanked AWS_* endpoint/profile vars, /dev/null shared config, private
+// HOME) applies; the helper used to build its own env with HOME=/tmp — a
+// world-writable directory on the config search path.
 func runS6cmdWithStdin(t *testing.T, workdir, endpoint, stdin string, args ...string) s6cmdResult {
 	t.Helper()
 	full := append([]string{"--endpoint-url", endpoint, "--path-style"}, args...)
-	cmd := exec.Command(s6cmdPath, full...)
-	cmd.Dir = workdir
-	cmd.Stdin = strings.NewReader(stdin)
-	env := append([]string{},
-		"AWS_ACCESS_KEY_ID="+defaultAccessKeyID,
-		"AWS_SECRET_ACCESS_KEY="+defaultSecretAccessKey,
-		"AWS_REGION="+defaultRegion,
-		"HOME=/tmp",
-		"PATH=/usr/bin:/bin",
-	)
-	cmd.Env = env
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	err := cmd.Run()
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			return s6cmdResult{stdout.String(), stderr.String(), exitErr.ExitCode()}
-		}
-		t.Fatalf("failed to run s6cmd: %v", err)
-	}
-	return s6cmdResult{stdout.String(), stderr.String(), 0}
+	return runS6cmdRawStdin(t, workdir, stdin, full)
 }
 
 // TestE2E_Pipe verifies that `echo "data" | s6cmd pipe s3://bucket/key`

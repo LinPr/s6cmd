@@ -3,6 +3,7 @@ package run
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"os/exec"
@@ -10,6 +11,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/LinPr/s6cmd/internal/cliutil"
 )
 
 // syncedWriter serializes concurrent writes to an underlying writer. The
@@ -226,3 +230,158 @@ func buildS6cmd(t *testing.T) string {
 	return binary
 }
 
+// TestGlobalFlagArgsPathStyleTriState pins the --path-style forwarding
+// semantics of globalFlagArgs: an unset flag is not forwarded (the child
+// re-derives the endpoint-dependent default itself), while an explicitly
+// set value — true or false — is forwarded verbatim so the child cannot
+// override an explicit --path-style=false with the path-style default for
+// custom endpoints.
+func TestGlobalFlagArgsPathStyleTriState(t *testing.T) {
+	t.Parallel()
+
+	// Unset: no --path-style argument at all.
+	args := globalFlagArgs(cliutil.CommonFlags{}, rootForward{})
+	for _, a := range args {
+		if strings.HasPrefix(a, "--path-style") {
+			t.Errorf("unset --path-style must not be forwarded, got %q", args)
+		}
+	}
+
+	// Explicit true.
+	args = globalFlagArgs(cliutil.CommonFlags{PathStyle: true, PathStyleSet: true}, rootForward{})
+	if !containsArg(args, "--path-style=true") {
+		t.Errorf("explicit --path-style must be forwarded as --path-style=true, got %q", args)
+	}
+
+	// Explicit false.
+	args = globalFlagArgs(cliutil.CommonFlags{PathStyle: false, PathStyleSet: true}, rootForward{})
+	if !containsArg(args, "--path-style=false") {
+		t.Errorf("explicit --path-style=false must be forwarded verbatim, got %q", args)
+	}
+}
+
+// TestGlobalFlagArgsForwarding pins which global flags reach the child
+// processes. --use-list-objects-v1 (CommonFlags) and the root-only --log /
+// --config / --stat used to be silently dropped, so children fell back to
+// their own defaults despite the package doc claiming the parent's global
+// flags are inherited.
+func TestGlobalFlagArgsForwarding(t *testing.T) {
+	t.Parallel()
+
+	// Defaults: nothing is forwarded.
+	if args := globalFlagArgs(cliutil.CommonFlags{}, rootForward{LogLevel: "info"}); len(args) != 0 {
+		t.Errorf("default flags must not be forwarded, got %q", args)
+	}
+
+	args := globalFlagArgs(cliutil.CommonFlags{
+		EndpointURL:      "http://127.0.0.1:9000",
+		UseListObjectsV1: true,
+	}, rootForward{
+		LogLevel: "debug",
+		Config:   "/path/to/s6cmd.yaml",
+		Stat:     true,
+	})
+
+	for _, want := range []string{"--use-list-objects-v1", "--stat"} {
+		if !containsArg(args, want) {
+			t.Errorf("args %q should contain %q", args, want)
+		}
+	}
+	for _, pair := range [][2]string{
+		{"--endpoint-url", "http://127.0.0.1:9000"},
+		{"--log", "debug"},
+		{"--config", "/path/to/s6cmd.yaml"},
+	} {
+		if !containsArgPair(args, pair[0], pair[1]) {
+			t.Errorf("args %q should contain %q %q", args, pair[0], pair[1])
+		}
+	}
+}
+
+// containsArgPair reports whether args contains name immediately followed
+// by value.
+func containsArgPair(args []string, name, value string) bool {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == name && args[i+1] == value {
+			return true
+		}
+	}
+	return false
+}
+
+// TestLineReaderCancelUnblocksBlockedRead verifies that canceling the
+// context interrupts a lineReader that is BLOCKED in a read. The read loop
+// used to check ctx only between reads, so `s6cmd run` on an idle
+// stdin/fifo sat in bufio.ReadString forever, immune to Ctrl-C, and had to
+// be SIGKILLed.
+func TestLineReaderCancelUnblocksBlockedRead(t *testing.T) {
+	t.Parallel()
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	defer w.Close() // keep the write end open: the read must stay blocked
+
+	ctx, cancel := context.WithCancel(context.Background())
+	lr := newLineReader(ctx, r)
+
+	// Feed one line to prove the reader works, then cancel while it is
+	// blocked waiting for the next line.
+	if _, err := w.WriteString("version\n"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	select {
+	case line := <-lr.lines():
+		if strings.TrimSpace(line) != "version" {
+			t.Fatalf("line = %q, want %q", line, "version")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the first line")
+	}
+
+	cancel()
+
+	// The lines channel must close promptly even though no further input
+	// (and no EOF) ever arrives on the pipe.
+	select {
+	case _, ok := <-lr.lines():
+		if ok {
+			t.Fatal("unexpected extra line after cancel")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("lineReader did not unblock after context cancelation")
+	}
+	if err := lr.Err(); !errors.Is(err, context.Canceled) {
+		t.Errorf("Err() = %v, want context.Canceled", err)
+	}
+}
+
+// TestLineReaderCleanEOF verifies the normal termination path is
+// unaffected: EOF closes the channel with a nil Err and does not close
+// the underlying reader (the caller owns it).
+func TestLineReaderCleanEOF(t *testing.T) {
+	t.Parallel()
+
+	lr := newLineReader(context.Background(), strings.NewReader("a\nb\n"))
+	var lines []string
+	for line := range lr.lines() {
+		lines = append(lines, strings.TrimSpace(line))
+	}
+	if len(lines) != 2 || lines[0] != "a" || lines[1] != "b" {
+		t.Fatalf("lines = %q, want [a b]", lines)
+	}
+	if err := lr.Err(); err != nil {
+		t.Errorf("Err() after clean EOF = %v, want nil", err)
+	}
+}
+
+// containsArg reports whether args contains exactly the given argument.
+func containsArg(args []string, want string) bool {
+	for _, a := range args {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}

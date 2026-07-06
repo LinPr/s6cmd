@@ -1,14 +1,17 @@
 // Package stat collects per-operation success/error counts so a summary
 // can be printed at the end of a run. It is opt-in: until InitStat is
-// called, Collect is a cheap no-op, so commands can always defer
-// Collect(...) without worrying about whether stats are enabled.
+// called (root --stat flag), Add and Collect are cheap no-ops, so callers
+// can report unconditionally without worrying about whether stats are
+// enabled.
 package stat
 
 import (
 	"bytes"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"text/tabwriter"
 
 	"github.com/LinPr/s6cmd/strutil"
@@ -22,7 +25,10 @@ const (
 )
 
 var (
-	enabled bool
+	// enabled gates every collection call. It is an atomic.Bool because
+	// Add/Collect run on worker goroutines while InitStat runs on the
+	// main goroutine.
+	enabled atomic.Bool
 	stats   statistics
 )
 
@@ -30,16 +36,16 @@ var (
 // attempts, keyed by operation name.
 type statistics [2]syncMapStrInt64
 
-// InitStat enables statistics collection. It must be called once at
-// startup before any command runs; otherwise Collect is a no-op.
+// InitStat enables statistics collection. It must be called before any
+// command runs (the root PersistentPreRunE does this when --stat is set);
+// otherwise Add and Collect are no-ops.
 func InitStat() {
-	enabled = true
 	for i := range stats {
 		stats[i] = syncMapStrInt64{
-			Mutex:       sync.Mutex{},
 			mapStrInt64: map[string]int64{},
 		}
 	}
+	enabled.Store(true)
 }
 
 // syncMapStrInt64 is a statically typed, synchronized map.
@@ -55,11 +61,36 @@ func (s *syncMapStrInt64) add(key string, val int64) {
 	s.mapStrInt64[key] += val
 }
 
+// snapshot returns a copy of the map taken under the lock.
+func (s *syncMapStrInt64) snapshot() map[string]int64 {
+	s.Lock()
+	defer s.Unlock()
+	out := make(map[string]int64, len(s.mapStrInt64))
+	for k, v := range s.mapStrInt64 {
+		out[k] = v
+	}
+	return out
+}
+
 // Stat is a single operation's statistics.
 type Stat struct {
 	Operation string `json:"operation"`
 	Success   int64  `json:"success"`
 	Error     int64  `json:"error"`
+}
+
+// Add records one completed operation. It is a no-op until InitStat has
+// been called. The log package calls it for every operation-attributed
+// Info (success) and Error (failure) message, so enabling --stat requires
+// no per-command wiring.
+func Add(op string, success bool) {
+	if !enabled.Load() {
+		return
+	}
+	if success {
+		stats[succCount].add(op, 1)
+	}
+	stats[totalCount].add(op, 1)
 }
 
 // Collect returns a closure intended for `defer` at the top of an Action.
@@ -69,13 +100,7 @@ type Stat struct {
 // collection is disabled, so it is safe to defer unconditionally.
 func Collect(op string, err *error) func() {
 	return func() {
-		if !enabled {
-			return
-		}
-		if err == nil || *err == nil {
-			stats[succCount].add(op, 1)
-		}
-		stats[totalCount].add(op, 1)
+		Add(op, err == nil || *err == nil)
 	}
 }
 
@@ -103,20 +128,25 @@ func (s Stats) JSON() string {
 	return builder.String()
 }
 
-// Statistics returns the stats collected so far. Returns an empty slice if
-// stat collection is disabled.
+// Statistics returns the stats collected so far, sorted by operation name
+// so the summary table is deterministic. Returns an empty slice if stat
+// collection is disabled. The maps are snapshotted under their mutexes so
+// Statistics is safe to call while workers are still adding.
 func Statistics() Stats {
-	if !enabled {
+	if !enabled.Load() {
 		return Stats{}
 	}
-	var result Stats
-	for op, total := range stats[totalCount].mapStrInt64 {
-		success := stats[succCount].mapStrInt64[op]
+	totals := stats[totalCount].snapshot()
+	successes := stats[succCount].snapshot()
+	result := make(Stats, 0, len(totals))
+	for op, total := range totals {
+		success := successes[op]
 		result = append(result, Stat{
 			Operation: op,
 			Success:   success,
 			Error:     total - success,
 		})
 	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Operation < result[j].Operation })
 	return result
 }

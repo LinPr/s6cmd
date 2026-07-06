@@ -7,7 +7,6 @@ import (
 
 	"github.com/LinPr/s6cmd/internal/cliutil"
 	"github.com/LinPr/s6cmd/storage"
-	s3store "github.com/LinPr/s6cmd/storage/s3"
 	"github.com/go-playground/validator/v10"
 	"github.com/spf13/cobra"
 )
@@ -26,16 +25,11 @@ func NewMbCmd() *cobra.Command {
 			if err := o.validate(); err != nil {
 				return err
 			}
-			ctx := cmd.Context()
-			if o.DryRun {
-				fmt.Fprintf(cmd.OutOrStdout(), "DRYRUN: would create bucket %s\n", o.S3Uri)
-				return nil
-			}
-			return o.run(ctx, cmd.OutOrStdout())
+			return o.run(cmd.Context(), cmd.OutOrStdout())
 		},
 	}
 
-	cmd.Flags().BoolVarP(&o.DryRun, "dryRun", "n", false, "show what would be transferred")
+	cmd.Flags().BoolVarP(&o.DryRun, "dry-run", "n", false, "check the bucket and print what would be created without creating it")
 
 	return &cmd
 }
@@ -60,6 +54,9 @@ func newOptions() *Options {
 func (o *Options) complete(cmd *cobra.Command, args []string) error {
 	o.S3Uri = args[0]
 	o.common = cliutil.LoadParentFlags(cmd)
+	// Propagate --dry-run into the store constructors: the existence
+	// check runs for real, CreateBucket becomes a no-op.
+	o.common.DryRun = o.DryRun
 	return nil
 }
 
@@ -79,14 +76,7 @@ func (o *Options) validate() error {
 }
 
 func (o *Options) run(ctx context.Context, out io.Writer) error {
-	opt := s3store.S3Option{
-		UsePathStyle: o.common.PathStyle,
-		Region:       o.common.Region,
-		Profile:      o.common.Profile,
-		Endpoint:     o.common.EndpointURL,
-		NoVerifySSL:  o.common.NoVerifySSL,
-	}
-	cli, err := s3store.NewS3Client(ctx, opt)
+	cli, err := cliutil.NewS3Client(ctx, o.common)
 	if err != nil {
 		return err
 	}

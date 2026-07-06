@@ -40,4 +40,5 @@ dist/
 
 .codex/
 .claude/
+.agents/
 CLAUDE.md

@@ -50,9 +50,12 @@ func (e *Error) Unwrap() error {
 }
 
 // IsCancelation reports whether the given error is (or wraps) a cancelation
-// error. It recognizes context.Canceled and smithy.CanceledError, which is
-// the form aws-sdk-go-v2 returns when an in-flight request is canceled. The
-// check recurses through errors.Unwrap so wrapped errors are handled.
+// error. Only context.Canceled counts: a canceled context means the user
+// (or the signal handler) asked the run to stop, so per-object cancelation
+// errors are not failures. context.DeadlineExceeded is deliberately NOT a
+// cancelation — a timed-out transfer is a real failure and must surface in
+// the exit code. errors.Is walks Unwrap chains, including errors.Join'ed
+// lists and *errorpkg.Error wrappers.
 func IsCancelation(err error) bool {
 	if err == nil {
 		return false
@@ -62,43 +65,16 @@ func IsCancelation(err error) bool {
 		return true
 	}
 
-	// smithy.CanceledError satisfies the interface checked by
-	// transport/http when a request is canceled mid-flight. Use As so we
-	// still match when the error is wrapped by middleware/op decorators.
+	// smithy.CanceledError is the marker aws-sdk-go-v2 returns when an
+	// in-flight request is canceled. It wraps ctx.Err(), so the errors.Is
+	// above already matches the common case; this handles a nil or opaque
+	// inner error. A CanceledError wrapping context.DeadlineExceeded is a
+	// timeout, not a cancelation, and stays a failure.
 	var canceledErr *smithy.CanceledError
 	if errors.As(err, &canceledErr) {
-		return true
+		return !errors.Is(err, context.DeadlineExceeded)
 	}
 
-	// Fall back to a string match for opaque wrappers that don't
-	// implement Unwrap correctly; smithy surfaces "canceled, ..." and
-	// aws-sdk-go-v2 may bubble up "context canceled" verbatim.
-	if containsCancelation(err.Error()) {
-		return true
-	}
-
-	return false
-}
-
-// containsCancelation reports whether the message indicates a cancelation.
-// It is intentionally narrow to avoid matching unrelated errors.
-func containsCancelation(msg string) bool {
-	return stringsContain(msg, "context canceled") ||
-		stringsContain(msg, "context deadline exceeded") ||
-		stringsContain(msg, "canceled,")
-}
-
-// stringsContain is a tiny wrapper so this file does not need to import
-// strings solely for two substring checks.
-func stringsContain(s, sub string) bool {
-	if len(sub) == 0 {
-		return true
-	}
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
 	return false
 }
 
@@ -130,18 +106,26 @@ var (
 	ErrObjectIsGlacier = errors.New("object is in Glacier storage class")
 )
 
-// IsWarning reports whether the given error is one of the sentinel warning
-// errors. Warnings are surfaced to the user but do not fail the command.
+// warningSentinels is the set of errors recognized by IsWarning.
+var warningSentinels = []error{
+	ErrObjectExists,
+	ErrObjectIsNewer,
+	ErrObjectSizesMatch,
+	ErrObjectIsNewerAndSizesMatch,
+	ErrNoObjectFound,
+	ErrGivenObjectNotFound,
+	ErrObjectIsGlacier,
+}
+
+// IsWarning reports whether the given error is (or wraps) one of the
+// sentinel warning errors. Warnings are surfaced to the user but do not
+// fail the command. errors.Is is used per sentinel so wrapped sentinels
+// (fmt.Errorf %w, *errorpkg.Error, errors.Join) are recognized too.
 func IsWarning(err error) bool {
-	switch err {
-	case ErrObjectExists,
-		ErrObjectIsNewer,
-		ErrObjectSizesMatch,
-		ErrObjectIsNewerAndSizesMatch,
-		ErrNoObjectFound,
-		ErrGivenObjectNotFound,
-		ErrObjectIsGlacier:
-		return true
+	for _, sentinel := range warningSentinels {
+		if errors.Is(err, sentinel) {
+			return true
+		}
 	}
 
 	return false

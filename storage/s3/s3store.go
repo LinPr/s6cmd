@@ -9,17 +9,25 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/LinPr/s6cmd/internal/errorpkg"
 	"github.com/LinPr/s6cmd/storage"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
+	// feature/s3/manager is deprecated in favour of feature/s3/transfermanager,
+	// but the replacement is still v0.x and lacks Range-request support and
+	// GetBucketRegion, so we deliberately stay on manager for now. Revisit the
+	// migration once transfermanager reaches feature parity.
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
 // defaultRegion is used when no region can be inferred from the user, the
@@ -87,15 +95,47 @@ type S3Store struct {
 // nil instead of retrying.
 const metadataKeyRetryID = "s6cmd-upload-retry-id"
 
-// newRetryer builds the SDK v2 retryer. It starts from retry.NewStandard
-// (which already covers throttling, 5xx, RequestTimeout, connection errors,
-// etc.) and layers on extra retryable error codes
-// (InternalError, RequestTimeTooSkewed, SlowDown) plus a deny-list for the
-// token errors (ExpiredToken, ExpiredTokenException, InvalidToken) which
-// must NOT be retried even if the standard rules would allow it.
+// classifyExtraRetryable classifies s6cmd's additional retry rules on top
+// of the SDK defaults: the extra retryable error codes (InternalError,
+// RequestTimeTooSkewed, SlowDown, plus "connection timed out" message
+// matches) return TrueTernary, the token errors (ExpiredToken,
+// ExpiredTokenException, InvalidToken) — which must NOT be retried even if
+// the standard rules would allow it — return FalseTernary, and everything
+// else returns UnknownTernary so the wrapped retryer decides.
+func classifyExtraRetryable(err error) aws.Ternary {
+	if err == nil {
+		return aws.UnknownTernary
+	}
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) {
+		return aws.UnknownTernary
+	}
+	switch apiErr.ErrorCode() {
+	case "InternalError", "RequestTimeTooSkewed", "SlowDown":
+		return aws.TrueTernary
+	case "ExpiredToken", "ExpiredTokenException", "InvalidToken":
+		return aws.FalseTernary
+	}
+	// "connection reset"/"connection timed out" are not separate
+	// error codes; they appear inside the error message. The v2
+	// standard retryer already handles "connection reset" via
+	// RetryableConnectionError, so we only add the timed-out
+	// variant here.
+	if strings.Contains(apiErr.ErrorMessage(), "connection timed out") {
+		return aws.TrueTernary
+	}
+	return aws.UnknownTernary
+}
+
+// newRetryer builds the SDK v2 retryer used when the user set an explicit
+// --retry-count. It starts from retry.NewStandard (which already covers
+// throttling, 5xx, RequestTimeout, connection errors, etc.) and layers on
+// the classifyExtraRetryable rules.
 //
-// MaxAttempts is set via retry.AddWithMaxAttempts. A non-positive max
-// leaves the SDK default in place.
+// MaxAttempts is set via retry.StandardOptions. A non-positive max leaves
+// the SDK default in place. Callers must construct a fresh retryer per
+// client (aws.Retryer implementations carry token-bucket state that must
+// not be shared).
 func newRetryer(max int) aws.Retryer {
 	std := retry.NewStandard(func(o *retry.StandardOptions) {
 		if max > 0 {
@@ -104,41 +144,63 @@ func newRetryer(max int) aws.Retryer {
 		// Append the extra retryable codes. StandardOptions already
 		// seeds Retryables with DefaultRetryables, so we append rather
 		// than replace.
-		o.Retryables = append(o.Retryables, retry.IsErrorRetryableFunc(func(err error) aws.Ternary {
-			if err == nil {
-				return aws.UnknownTernary
-			}
-			var apiErr smithy.APIError
-			if !errors.As(err, &apiErr) {
-				return aws.UnknownTernary
-			}
-			switch apiErr.ErrorCode() {
-			case "InternalError", "RequestTimeTooSkewed", "SlowDown":
-				return aws.TrueTernary
-			case "ExpiredToken", "ExpiredTokenException", "InvalidToken":
-				return aws.FalseTernary
-			}
-			// "connection reset"/"connection timed out" are not separate
-			// error codes; they appear inside the error message. The v2
-			// standard retryer already handles "connection reset" via
-			// RetryableConnectionError, so we only add the timed-out
-			// variant here.
-			if strings.Contains(apiErr.ErrorMessage(), "connection timed out") {
-				return aws.TrueTernary
-			}
-			return aws.UnknownTernary
-		}))
+		o.Retryables = append(o.Retryables, retry.IsErrorRetryableFunc(classifyExtraRetryable))
 	})
 	return std
 }
 
-// NewS3Client builds an S3Store from the given options. If Region is empty
-// the region is auto-detected via manager.GetBucketRegion when the option
-// carries a bucket hint; otherwise the SDK default (us-east-1) is used.
+// extendedRetryer wraps the config-resolved retryer (which already honours
+// AWS_MAX_ATTEMPTS / AWS_RETRY_MODE / shared-config max_attempts) with the
+// classifyExtraRetryable rules. It is installed when the user did NOT set
+// an explicit --retry-count, so the SDK's own env/config retry resolution
+// stays authoritative for the attempt budget while the s6cmd-specific
+// retryable codes and the token-error deny-list still apply.
+type extendedRetryer struct {
+	aws.Retryer
+}
+
+func (r *extendedRetryer) IsErrorRetryable(err error) bool {
+	switch classifyExtraRetryable(err) {
+	case aws.TrueTernary:
+		return true
+	case aws.FalseTernary:
+		return false
+	}
+	return r.Retryer.IsErrorRetryable(err)
+}
+
+// resolveUsePathStyle implements the addressing policy:
 //
-// Addressing: option.UsePathStyle is forwarded to the SDK verbatim.
+//   - An explicit --path-style (true or false, from flag/env/config —
+//     option.PathStyleExplicit) always wins. Explicit false keeps
+//     virtual-host addressing for custom endpoints that support it
+//     (e.g. Aliyun OSS).
+//   - A custom endpoint with the flag unset defaults to path-style, the
+//     s5cmd/mc behaviour: virtual-host addressing would inject the bucket
+//     into the endpoint hostname ("mybucket.minio.local"), which almost
+//     never resolves for MinIO-style named endpoints.
+//   - No custom endpoint keeps the SDK default (virtual-host), unless the
+//     caller opted into path-style programmatically.
+func resolveUsePathStyle(option S3Option, customEndpoint bool) bool {
+	if option.PathStyleExplicit {
+		return option.UsePathStyle
+	}
+	if customEndpoint {
+		return true
+	}
+	return option.UsePathStyle
+}
+
+// NewS3Client builds an S3Store from the given options. If Region is empty
+// the SDK-resolved region is used, falling back to us-east-1.
+//
+// Addressing: see resolveUsePathStyle.
 //   - true  → path-style (https://endpoint/bucket/key)
 //   - false → virtual-host (https://bucket.endpoint/key), the AWS default
+//
+// A custom endpoint is installed as s3.Options.BaseEndpoint; the addressing
+// style above applies to custom endpoints too (with UsePathStyle=false the
+// SDK injects the bucket into the endpoint hostname).
 //
 // A transfer-acceleration endpoint enables s3.Options.UseAccelerate and the
 // SDK owns the endpoint (the parsed URL is reset to the sentinel).
@@ -160,65 +222,88 @@ func NewS3Client(ctx context.Context, option S3Option) (*S3Store, error) {
 	if option.Region != "" {
 		optFns = append(optFns, config.WithRegion(option.Region))
 	}
-	if option.Profile != "" {
+	// NoSignRequest sends anonymous requests, so credential sources are
+	// irrelevant: skip the profile / shared-credentials wiring entirely.
+	// An env-resolved AWS_PROFILE pointing at a missing profile would
+	// otherwise fail config loading even though no credentials are needed.
+	if option.Profile != "" && !option.NoSignRequest {
 		optFns = append(optFns, config.WithSharedConfigProfile(option.Profile))
 	}
-	if option.CredentialFile != "" {
+	if option.CredentialFile != "" && !option.NoSignRequest {
 		optFns = append(optFns, config.WithSharedConfigFiles([]string{option.CredentialFile}))
 	}
+	// Retry wiring. Only an explicit --retry-count (>0) replaces the SDK
+	// retryer wholesale: config.WithRetryer would otherwise silently
+	// disable the SDK's own AWS_MAX_ATTEMPTS / AWS_RETRY_MODE /
+	// shared-config max_attempts resolution. When the flag is unset
+	// (MaxRetries<=0), the config-resolved retryer is kept and the extra
+	// retryable codes + token-error deny-list are layered on top in the
+	// s3.NewFromConfig options closure below. The closure returns a fresh
+	// retryer per invocation because aws.Retryer carries token-bucket
+	// state that must not be shared between clients.
 	if option.MaxRetries > 0 {
-		retryer := newRetryer(option.MaxRetries)
-		optFns = append(optFns, config.WithRetryer(func() aws.Retryer { return retryer }))
+		optFns = append(optFns, config.WithRetryer(func() aws.Retryer { return newRetryer(option.MaxRetries) }))
 	}
-	if option.NoVerifySSL {
-		transport := http.DefaultTransport.(*http.Transport).Clone()
-		if transport.TLSClientConfig == nil {
-			transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-		} else {
-			transport.TLSClientConfig.InsecureSkipVerify = true
+
+	// HTTP client: always start from the SDK's BuildableClient so the SDK
+	// connection-pool tuning survives (a bare http.DefaultTransport clone
+	// keeps MaxIdleConnsPerHost=2, which cripples concurrent transfers).
+	// No overall client timeout — large transfers can legitimately run for
+	// hours — but cap the wait for response headers.
+	httpClient := awshttp.NewBuildableClient().WithTransportOptions(func(tr *http.Transport) {
+		tr.MaxIdleConns = 100
+		tr.MaxIdleConnsPerHost = 100
+		tr.ResponseHeaderTimeout = 30 * time.Second
+		if option.NoVerifySSL {
+			if tr.TLSClientConfig == nil {
+				tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+			} else {
+				tr.TLSClientConfig.InsecureSkipVerify = true
+			}
 		}
-		httpClient := &http.Client{Transport: transport}
-		optFns = append(optFns, config.WithHTTPClient(httpClient))
-	}
-	// Custom endpoint (non-accelerate). HostnameImmutable=true keeps the
-	// SDK from rewriting the host when virtual-host addressing kicks in,
-	// which is what most S3-compatible services expect.
-	if endpointURL != sentinelURL {
-		resolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
-			return aws.Endpoint{
-				URL:               endpointURL.String(),
-				SigningRegion:     region,
-				HostnameImmutable: true,
-			}, nil
-		})
-		optFns = append(optFns, config.WithEndpointResolverWithOptions(resolver))
-	}
+	})
+	optFns = append(optFns, config.WithHTTPClient(httpClient))
 
 	conf, err := config.LoadDefaultConfig(ctx, optFns...)
 	if err != nil {
 		return nil, err
 	}
 
-	// Region auto-detection: when the user did not specify a region but did
-	// specify a bucket (e.g. via NewRemoteClient), probe the bucket's region
-	// via manager.GetBucketRegion. The probe is best-effort; on failure we
-	// fall back to the SDK's configured region or us-east-1.
-	if option.Region == "" && option.bucket != "" {
-		if region, err := manager.GetBucketRegion(ctx, s3.NewFromConfig(conf), option.bucket); err == nil && region != "" {
-			conf.Region = region
-		} else if option.bucket == "" {
-			conf.Region = defaultRegion
-		}
-	}
 	if conf.Region == "" {
 		conf.Region = defaultRegion
 	}
 
 	client := s3.NewFromConfig(conf, func(o *s3.Options) {
-		o.UsePathStyle = option.UsePathStyle
-		o.UseAccelerate = useAccelerate
+		o.UsePathStyle = resolveUsePathStyle(option, endpointURL != sentinelURL)
+		o.UseAccelerate = useAccelerate || option.UseAccelerate
+		switch {
+		case option.MaxRetries > 0:
+			// Explicit --retry-count: pin RetryMaxAttempts too, so an
+			// ambient AWS_MAX_ATTEMPTS cannot re-wrap the retryer with a
+			// different budget in finalizeRetryMaxAttempts — the explicit
+			// flag has the highest priority.
+			o.RetryMaxAttempts = option.MaxRetries
+		default:
+			// Flag unset: keep the config-resolved retryer (env / shared
+			// config attempt budget and mode) and layer the extra
+			// retryable codes + token-error deny-list on top.
+			o.Retryer = &extendedRetryer{Retryer: o.Retryer}
+		}
 		if option.NoSignRequest {
-			o.Credentials = nil // anonymous credentials
+			o.Credentials = aws.AnonymousCredentials{}
+		}
+		// Custom endpoint (non-accelerate): BaseEndpoint replaces the
+		// deprecated EndpointResolverWithOptions. Virtual-host addressing
+		// (UsePathStyle=false) injects the bucket into the endpoint
+		// hostname; path-style keeps the host as-is with /bucket/key.
+		if endpointURL != sentinelURL {
+			o.BaseEndpoint = aws.String(endpointURL.String())
+			// S3-compatible services often reject the SDK's default CRC32
+			// request checksums, so only checksum when the operation
+			// requires it. AWS-default behavior is kept when no custom
+			// endpoint is configured.
+			o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+			o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
 		}
 	})
 
@@ -338,3 +423,20 @@ func statObjectNotFound(url *storage.StorageURL, err error) error {
 
 // trimEtag strips the surrounding quotes that S3 wraps around ETag values.
 func trimEtag(v string) string { return strings.Trim(v, `"`) }
+
+// withContentMD5 is a per-call option that replaces the SDK's flexible
+// checksum middleware (which sends x-amz-checksum-crc32) with the legacy
+// Content-MD5 header. DeleteObjects REQUIRES a payload checksum, and several
+// S3-compatible services (Aliyun OSS, older MinIO/Ceph) only accept
+// Content-MD5 there, rejecting the CRC32 header with MissingArgument.
+// Amazon S3 accepts Content-MD5 on DeleteObjects too (it was the required
+// header for years), so applying it unconditionally is safe for both.
+func withContentMD5(o *s3.Options) {
+	o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
+		// Best-effort removal: the IDs are stable in the vendored SDK, but a
+		// missing middleware just means there is nothing to replace.
+		_, _ = stack.Finalize.Remove("AWSChecksum:ComputeInputPayloadChecksum")
+		_, _ = stack.Finalize.Remove("addInputChecksumTrailer")
+		return smithyhttp.AddContentChecksumMiddleware(stack)
+	})
+}

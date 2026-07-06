@@ -23,10 +23,6 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// megabyte is the conversion factor from MiB to bytes used for --part-size,
-// which the user supplies in MiB but storage.Put expects in bytes.
-const megabyte = 1024 * 1024
-
 // NewPipeCmd creates the `pipe` command.
 func NewPipeCmd() *cobra.Command {
 	o := newOptions()
@@ -60,7 +56,14 @@ func NewPipeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&o.ContentType, "content-type", "", "set content type header for object")
 	cmd.Flags().StringVar(&o.ContentEncoding, "content-encoding", "", "set content encoding header for object")
 	cmd.Flags().StringVar(&o.ContentDisposition, "content-disposition", "", "set content disposition header for object")
-	cmd.Flags().BoolVarP(&o.NoClobber, "no-clobber", "n", false, "do not overwrite destination if already exists")
+	// pipe has NO -n shorthand at all: -n historically meant --no-clobber
+	// here while every other command uses it for --dry-run. Re-pointing
+	// the shorthand at --dry-run silently changed the meaning of a legacy
+	// `pipe -n` from "don't overwrite" to "upload nothing and exit 0" —
+	// worse than failing. Both flags are long-form only, so legacy usage
+	// fails loudly with a usage error instead.
+	cmd.Flags().BoolVar(&o.NoClobber, "no-clobber", false, "do not overwrite destination if already exists")
+	cmd.Flags().BoolVar(&o.DryRun, "dry-run", false, "print what would be uploaded without sending anything")
 
 	return &cmd
 }
@@ -87,6 +90,7 @@ type Flags struct {
 	ContentEncoding    string
 	ContentDisposition string
 	NoClobber          bool
+	DryRun             bool
 }
 
 // Options is the closure of Args + Flags + CommonFlags.
@@ -103,6 +107,9 @@ func newOptions() *Options {
 func (o *Options) complete(cmd *cobra.Command, args []string) error {
 	o.DestUri = args[0]
 	o.common = cliutil.LoadParentFlags(cmd)
+	// Propagate --dry-run into the store constructors so the Put becomes
+	// a no-op (stdin is left unread).
+	o.common.DryRun = o.DryRun
 	return nil
 }
 
@@ -162,10 +169,7 @@ func (o *Options) run(ctx context.Context) error {
 		EncryptionKeyID:    o.SSEKMSKeyID,
 	}
 
-	partSize := int64(o.PartSizeMiB) * megabyte
-	if partSize <= 0 {
-		partSize = int64(cliutil.DefaultPartSizeMiB) * megabyte
-	}
+	partSize := cliutil.PartSizeBytesFromMiB(o.PartSizeMiB)
 	concurrency := o.Concurrency
 	if concurrency <= 0 {
 		concurrency = cliutil.DefaultCopyConcurrency

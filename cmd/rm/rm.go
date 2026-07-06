@@ -1,6 +1,6 @@
 // Package rm implements the `s6cmd rm` command. The rm command structure
-// is expandSources -> MultiDelete + parallel.Waiter, and uses cobra +
-// aws-sdk-go-v2 + the s6cmd parallel.Manager framework.
+// is expandRmSources -> storage.MultiDelete, and uses cobra +
+// aws-sdk-go-v2 + the s6cmd storage aggregate.
 //
 // The command supports:
 //   - --exclude / --include wildcard patterns (repeatable)
@@ -21,7 +21,6 @@ import (
 
 	"github.com/LinPr/s6cmd/internal/cliutil"
 	"github.com/LinPr/s6cmd/internal/errorpkg"
-	"github.com/LinPr/s6cmd/internal/parallel"
 	"github.com/LinPr/s6cmd/log"
 	"github.com/LinPr/s6cmd/storage"
 	"github.com/go-playground/validator/v10"
@@ -47,16 +46,11 @@ func NewRmCmd() *cobra.Command {
 			if err := o.validate(); err != nil {
 				return err
 			}
-			ctx := cmd.Context()
-			if o.DryRun {
-				fmt.Fprintf(cmd.OutOrStdout(), "DRYRUN: rm %s\n", o.S3Uri)
-				return nil
-			}
-			return o.run(ctx)
+			return o.run(cmd.Context())
 		},
 	}
 
-	cmd.Flags().BoolVarP(&o.DryRun, "dryRun", "n", false, "show what would be removed")
+	cmd.Flags().BoolVarP(&o.DryRun, "dry-run", "n", false, "plan the removal and print one line per object without deleting anything")
 	cmd.Flags().BoolVar(&o.Recursive, "recursive", false, "remove objects recursively under a prefix")
 	cmd.Flags().BoolVar(&o.AllVersions, "all-versions", false, "list all versions of object(s)")
 	cmd.Flags().StringVar(&o.VersionID, "version-id", "", "use the specified version of an object")
@@ -96,6 +90,11 @@ func newOptions() *Options {
 
 func (o *Options) complete(cmd *cobra.Command) error {
 	o.CommonFlags = cliutil.LoadParentFlags(cmd)
+	// Propagate --dry-run into the store constructors: listing and
+	// filtering run for real, MultiDelete becomes a per-URL no-op that
+	// still reports each key, so the command prints exactly what a real
+	// run would delete.
+	o.CommonFlags.DryRun = o.DryRun
 	return nil
 }
 
@@ -157,32 +156,45 @@ func (o *Options) run(ctx context.Context) error {
 		return err
 	}
 
+	// Split listing failures from deletable URLs on the main goroutine
+	// before the producer starts: the errs slice is also appended to by the
+	// result-channel drain below, so collecting listing errors here keeps
+	// every append on one goroutine. Listing errors join the aggregated
+	// exit-code errors — they used to be logged only, which let a failed
+	// listing exit 0. AggregateErrors still drops warning sentinels, so a
+	// wildcard that matches nothing keeps exiting 0.
+	errs := make([]error, 0)
+	deletable := make([]*storage.StorageURL, 0, len(objects))
+	for _, obj := range objects {
+		if obj.Err != nil {
+			if errorpkg.IsCancelation(obj.Err) {
+				continue
+			}
+			log.Error(log.ErrorMessage{Operation: "rm", Err: obj.Err.Error()})
+			errs = append(errs, obj.Err)
+			continue
+		}
+		if obj.Type.IsDir() {
+			continue
+		}
+		name := obj.StorageURL.Relative()
+		if name == "" {
+			name = obj.StorageURL.Absolute()
+		}
+		if cliutil.IsObjectExcluded(name, excludePatterns, includePatterns) {
+			continue
+		}
+		deletable = append(deletable, obj.StorageURL)
+	}
+
 	// Build the URL channel consumed by MultiDelete. We feed it from a
 	// goroutine so MultiDelete's batching goroutine can start draining
-	// immediately, and so we can apply exclude/include filtering without
-	// blocking the listing goroutine.
+	// immediately.
 	urlCh := make(chan *storage.StorageURL)
 	go func() {
 		defer close(urlCh)
-		for _, obj := range objects {
-			if obj.Err != nil && errorpkg.IsCancelation(obj.Err) {
-				continue
-			}
-			if obj.Err != nil {
-				log.Error(log.ErrorMessage{Operation: "rm", Err: obj.Err.Error()})
-				continue
-			}
-			if obj.Type.IsDir() {
-				continue
-			}
-			name := obj.StorageURL.Relative()
-			if name == "" {
-				name = obj.StorageURL.Absolute()
-			}
-			if cliutil.IsObjectExcluded(name, excludePatterns, includePatterns) {
-				continue
-			}
-			urlCh <- obj.StorageURL
+		for _, url := range deletable {
+			urlCh <- url
 		}
 	}()
 
@@ -190,7 +202,6 @@ func (o *Options) run(ctx context.Context) error {
 	// goroutine so the log output is ordered and so we can aggregate
 	// errors into the final return.
 	resultCh := store.MultiDelete(ctx, urlCh)
-	errs := make([]error, 0)
 	for obj := range resultCh {
 		if obj.Err != nil {
 			if errorpkg.IsCancelation(obj.Err) {
@@ -218,9 +229,14 @@ func (o *Options) run(ctx context.Context) error {
 // cleared so ListObjectsV2 returns every object under the prefix rather
 // than collapsing sub-prefixes into CommonPrefixes.
 func expandRmSources(ctx context.Context, store *storage.Storage, src *storage.StorageURL) ([]*storage.Object, error) {
+	single := !src.IsWildcard() && !src.IsBucket() && !src.IsPrefix()
+
 	// Single object: stat first so we surface a clear "not found" error
-	// before invoking MultiDelete.
-	if !src.IsWildcard() && !src.IsBucket() && !src.IsPrefix() {
+	// before invoking MultiDelete. With --all-versions we must list
+	// instead: Stat only sees the current version (and 404s when the
+	// latest entry is a delete marker), while ListObjectVersions returns
+	// every version plus the markers.
+	if single && !src.AllVersions {
 		obj, err := store.Stat(ctx, src)
 		if err != nil {
 			return nil, err
@@ -230,13 +246,14 @@ func expandRmSources(ctx context.Context, store *storage.Storage, src *storage.S
 
 	out := make([]*storage.Object, 0, 64)
 	for obj := range store.List(ctx, src, false) {
+		// ListObjectVersions is prefix-based, so for a single-key
+		// --all-versions URL it also returns sibling keys that share the
+		// prefix (e.g. "logs" matches "logs2"). Keep only exact key
+		// matches in that case.
+		if single && obj.Err == nil && obj.StorageURL != nil && obj.StorageURL.Path != src.Path {
+			continue
+		}
 		out = append(out, obj)
 	}
 	return out, nil
 }
-
-// parallel is referenced via the import below so the global Manager is
-// initialized at startup. rm does not call parallel.Run directly (the
-// batching is handled inside MultiDelete) but importing the package keeps
-// the dependency visible at the top of the file.
-var _ = parallel.NewWaiter

@@ -3,9 +3,8 @@ package s3store
 // S3Option stores configuration for the S3 storage backend. Field status is
 // annotated so callers know what is wired up vs. what is still a TODO.
 type S3Option struct {
-	// Region is the AWS region to use. When empty, NewS3Client will attempt
-	// to auto-detect via manager.GetBucketRegion if Bucket is set, and fall
-	// back to us-east-1.
+	// Region is the AWS region to use. When empty, the SDK-resolved region
+	// (environment / shared config) is used, falling back to us-east-1.
 	//
 	// Status: implemented.
 	Region string
@@ -14,11 +13,25 @@ type S3Option struct {
 	//   - true:  force path-style addressing (https://endpoint/bucket/key).
 	//           Required for MinIO, Alibaba OSS, Tencent COS, GCS and most
 	//           S3-compatible services.
-	//   - false (default): virtual-host addressing
-	//           (https://bucket.endpoint/key), which is the AWS S3 default.
+	//   - false: virtual-host addressing (https://bucket.endpoint/key),
+	//           which is the AWS S3 default.
+	//
+	// When PathStyleExplicit is false (the user did not set --path-style
+	// via flag/env/config) and a custom Endpoint is configured, path-style
+	// is used regardless of this field — see resolveUsePathStyle.
 	//
 	// Status: implemented.
 	UsePathStyle bool
+
+	// PathStyleExplicit reports that UsePathStyle was set explicitly by
+	// the user (command-line flag, environment variable or config file).
+	// An explicit value — true or false — is forwarded to the SDK verbatim;
+	// an unset flag defaults to path-style when a custom Endpoint is
+	// configured (the s5cmd/mc behaviour) and to the SDK default
+	// (virtual-host) otherwise.
+	//
+	// Status: implemented.
+	PathStyleExplicit bool
 
 	// Profile selects a named profile from the shared credentials file.
 	//
@@ -61,13 +74,16 @@ type S3Option struct {
 	RequestPayer string
 
 	// MaxRetries is the maximum number of attempts the SDK retryer will
-	// make for a retriable request. A non-positive value leaves the SDK
-	// default (3) in place. The retryer is the v2 standard retryer
-	// (retry.NewStandard) extended with extra retryable error codes
+	// make for a retriable request (--retry-count). A positive value
+	// installs the v2 standard retryer (retry.NewStandard) with that
+	// attempt budget, extended with extra retryable error codes
 	// (InternalError, RequestTimeTooSkewed, SlowDown, plus
-	// connection-reset/connection-timed-out string matches) and with the
-	// token errors (ExpiredToken/ExpiredTokenException/InvalidToken)
-	// explicitly excluded.
+	// connection-timed-out string matches) and with the token errors
+	// (ExpiredToken/ExpiredTokenException/InvalidToken) explicitly
+	// excluded. A non-positive value keeps the SDK's own retry resolution
+	// (AWS_MAX_ATTEMPTS / AWS_RETRY_MODE / shared-config max_attempts,
+	// defaulting to 3 attempts) and layers the same extra codes and
+	// deny-list on top of the resolved retryer.
 	//
 	// Status: implemented.
 	MaxRetries int
@@ -93,15 +109,10 @@ type S3Option struct {
 	// Status: implemented.
 	CredentialFile string
 
-	// UseAccelerate enables S3 Transfer Acceleration. When nil/false the
-	// value is auto-detected from the endpoint (an s3-accelerate.amazonaws.com
-	// endpoint enables acceleration). Set explicitly to override.
+	// UseAccelerate enables S3 Transfer Acceleration. When false the value
+	// is auto-detected from the endpoint (an s3-accelerate.amazonaws.com
+	// endpoint enables acceleration). Set explicitly to force it on.
 	//
 	// Status: implemented.
 	UseAccelerate bool
-
-	// bucket is an internal hint used by NewS3Client to probe the bucket
-	// region via manager.GetBucketRegion when Region is empty. It is set
-	// by higher-level constructors (e.g. storage.NewRemoteClient).
-	bucket string
 }

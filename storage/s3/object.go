@@ -161,6 +161,10 @@ func (s *S3Store) listObjects(ctx context.Context, url *storage.StorageURL) <-ch
 		}
 
 		objectFound := false
+		// prevMarker remembers the marker of the previous page so a
+		// misbehaving server that keeps returning IsTruncated=true without
+		// advancing the marker cannot loop this goroutine forever.
+		prevMarker := ""
 		for {
 			page, err := s.client.ListObjects(ctx, listInput)
 			if err != nil {
@@ -203,10 +207,32 @@ func (s *S3Store) listObjects(ctx context.Context, url *storage.StorageURL) <-ch
 			if !aws.ToBool(page.IsTruncated) {
 				break
 			}
-			if page.NextMarker == nil || *page.NextMarker == "" {
-				break
+			var nextMarker string
+			switch {
+			case page.NextMarker != nil && *page.NextMarker != "":
+				nextMarker = *page.NextMarker
+			case len(page.Contents) > 0:
+				// S3 only returns NextMarker when Delimiter is set. Per
+				// the ListObjects contract, the last returned key is the
+				// marker for the next page in that case.
+				nextMarker = aws.ToString(page.Contents[len(page.Contents)-1].Key)
+			default:
+				// An empty Contents page with IsTruncated set has no
+				// usable marker; break rather than loop forever.
+				nextMarker = ""
 			}
-			listInput.Marker = page.NextMarker
+			// Keys are listed in ascending order, so a valid next marker is
+			// always strictly greater than the previous one. A server that
+			// reports IsTruncated=true without advancing the marker (e.g.
+			// re-emitting the same page) would otherwise loop forever.
+			if nextMarker == "" || nextMarker <= prevMarker {
+				sendObject(ctx, &storage.Object{
+					Err: fmt.Errorf("listObjects: server returned a truncated page with a non-advancing marker %q; aborting listing to avoid an infinite loop", nextMarker),
+				}, objCh)
+				return
+			}
+			prevMarker = nextMarker
+			listInput.Marker = aws.String(nextMarker)
 		}
 
 		if !objectFound {
@@ -265,6 +291,7 @@ func (s *S3Store) listObjectVersions(ctx context.Context, url *storage.StorageUR
 				objectFound = true
 				mod := aws.ToTime(obj.LastModified)
 				newURL := url.Clone()
+				newURL.Path = key
 				newURL.VersionID = aws.ToString(obj.VersionId)
 				sendObject(ctx, &storage.Object{
 					StorageURL:   newURL,
@@ -273,6 +300,29 @@ func (s *S3Store) listObjectVersions(ctx context.Context, url *storage.StorageUR
 					Size:         aws.ToInt64(obj.Size),
 					StorageClass: storage.StorageClass(string(obj.StorageClass)),
 					VersionID:    aws.ToString(obj.VersionId),
+				}, objCh)
+			}
+
+			// Delete markers are first-class entries in a versioned bucket:
+			// without deleting them a bucket can never be fully purged
+			// (DeleteBucket keeps failing with BucketNotEmpty). Emit them as
+			// Key+VersionId objects flagged IsDeleteMarker so callers can
+			// render them distinctly.
+			for _, marker := range page.DeleteMarkers {
+				key := aws.ToString(marker.Key)
+				if !url.Match(key) {
+					continue
+				}
+				objectFound = true
+				mod := aws.ToTime(marker.LastModified)
+				newURL := url.Clone()
+				newURL.Path = key
+				newURL.VersionID = aws.ToString(marker.VersionId)
+				sendObject(ctx, &storage.Object{
+					StorageURL:     newURL,
+					ModTime:        &mod,
+					VersionID:      aws.ToString(marker.VersionId),
+					IsDeleteMarker: true,
 				}, objCh)
 			}
 		}
@@ -341,16 +391,22 @@ func (s *S3Store) Copy(ctx context.Context, src, dst *storage.StorageURL, metada
 	return err
 }
 
-// Delete deletes a single S3 object.
+// Delete deletes a single S3 object. When the URL carries a VersionID the
+// specific version is deleted permanently; without it a versioned bucket
+// just records a delete marker.
 func (s *S3Store) Delete(ctx context.Context, url *storage.StorageURL) error {
 	if s.dryRun {
 		return nil
 	}
-	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+	input := &s3.DeleteObjectInput{
 		Bucket:       aws.String(url.Bucket),
 		Key:          aws.String(url.Path),
 		RequestPayer: s.requestPayer(),
-	})
+	}
+	if url.VersionID != "" {
+		input.VersionId = aws.String(url.VersionID)
+	}
+	_, err := s.client.DeleteObject(ctx, input)
 	return err
 }
 
@@ -360,7 +416,10 @@ type chunk struct {
 	Keys   []types.ObjectIdentifier
 }
 
-// calculateChunks reads URLs from urlch and emits delete-sized chunks.
+// calculateChunks reads URLs from urlch and emits delete-sized chunks. A
+// chunk never spans buckets: when the incoming bucket changes, the current
+// chunk is flushed so its keys are deleted against the bucket they belong
+// to.
 func calculateChunks(urlch <-chan *storage.StorageURL) <-chan chunk {
 	chunkch := make(chan chunk)
 	go func() {
@@ -369,6 +428,10 @@ func calculateChunks(urlch <-chan *storage.StorageURL) <-chan chunk {
 		var keys []types.ObjectIdentifier
 		var bucket string
 		for u := range urlch {
+			if u.Bucket != bucket && len(keys) > 0 {
+				chunkch <- chunk{Bucket: bucket, Keys: keys}
+				keys = nil
+			}
 			bucket = u.Bucket
 			objid := types.ObjectIdentifier{Key: aws.String(u.Path)}
 			if u.VersionID != "" {
@@ -400,7 +463,9 @@ func (s *S3Store) MultiDelete(ctx context.Context, urlch <-chan *storage.Storage
 				for _, k := range c.Keys {
 					key := aws.ToString(k.Key)
 					u, _ := storage.NewStorageURL("s3://" + c.Bucket + "/" + key)
-					u.VersionID = aws.ToString(k.VersionId)
+					if u != nil {
+						u.VersionID = aws.ToString(k.VersionId)
+					}
 					resultch <- &storage.Object{StorageURL: u}
 				}
 				continue
@@ -410,20 +475,36 @@ func (s *S3Store) MultiDelete(ctx context.Context, urlch <-chan *storage.Storage
 				Bucket:       aws.String(c.Bucket),
 				Delete:       &types.Delete{Objects: c.Keys, Quiet: aws.Bool(true)},
 				RequestPayer: s.requestPayer(),
-			})
+			}, withContentMD5)
 			if err != nil {
+				// Emit the error but keep consuming the remaining chunks:
+				// returning here would leave calculateChunks (and the
+				// upstream URL producer) blocked on a send forever.
 				resultch <- &storage.Object{Err: err}
-				return
+				continue
 			}
+			// Quiet=true suppresses output.Deleted, so successes are derived
+			// as the chunk's keys minus the reported errors.
+			failed := make(map[string]struct{}, len(output.Errors))
 			for _, derr := range output.Errors {
+				failed[aws.ToString(derr.Key)+"\x00"+aws.ToString(derr.VersionId)] = struct{}{}
 				u, _ := storage.NewStorageURL("s3://" + c.Bucket + "/" + aws.ToString(derr.Key))
+				if u != nil {
+					u.VersionID = aws.ToString(derr.VersionId)
+				}
 				resultch <- &storage.Object{
 					StorageURL: u,
 					Err:        fmt.Errorf("%s: %s", aws.ToString(derr.Code), aws.ToString(derr.Message)),
 				}
 			}
-			for _, del := range output.Deleted {
-				u, _ := storage.NewStorageURL("s3://" + c.Bucket + "/" + aws.ToString(del.Key))
+			for _, k := range c.Keys {
+				if _, ok := failed[aws.ToString(k.Key)+"\x00"+aws.ToString(k.VersionId)]; ok {
+					continue
+				}
+				u, _ := storage.NewStorageURL("s3://" + c.Bucket + "/" + aws.ToString(k.Key))
+				if u != nil {
+					u.VersionID = aws.ToString(k.VersionId)
+				}
 				resultch <- &storage.Object{StorageURL: u}
 			}
 		}
@@ -551,8 +632,14 @@ func (s *S3Store) Put(ctx context.Context, reader io.Reader, to *storage.Storage
 // The retry id is read from input.Metadata, which the caller populated
 // before the first attempt. The same id is reused for every retry so a
 // successful retry can be detected by a subsequent Stat.
+//
+// The failed attempt consumed input.Body, so a retry must rewind it to the
+// start before re-uploading. When the body is not seekable (stdin/pipe) a
+// retry would upload truncated data; in that case the original error is
+// returned with a message explaining why no retry happened.
 func (s *S3Store) retryOnNoSuchUpload(ctx context.Context, to *storage.StorageURL, input *s3.PutObjectInput, err error, opts ...func(*manager.Uploader)) error {
-	expectedRetryID, _ := input.Metadata[metadataKeyRetryID]
+	expectedRetryID := input.Metadata[metadataKeyRetryID]
+	seeker, seekable := input.Body.(io.Seeker)
 
 	attempts := 0
 	for errHasCode(err, "NoSuchUpload") && attempts < s.noSuchUploadRetryCount {
@@ -560,6 +647,12 @@ func (s *S3Store) retryOnNoSuchUpload(ctx context.Context, to *storage.StorageUR
 		obj, sErr := s.Stat(ctx, to)
 		if sErr == nil && obj != nil && obj.RetryID() == expectedRetryID && expectedRetryID != "" {
 			return nil
+		}
+		if !seekable {
+			return fmt.Errorf("RetryOnNoSuchUpload: cannot retry upload of %q: request body is not seekable (e.g. stdin/pipe): %w", to.String(), err)
+		}
+		if _, seekErr := seeker.Seek(0, io.SeekStart); seekErr != nil {
+			return fmt.Errorf("RetryOnNoSuchUpload: rewind request body for retry: %v: %w", seekErr, err)
 		}
 		_, err = s.uploader.Upload(ctx, input, opts...)
 	}
@@ -628,12 +721,19 @@ func (s *S3Store) Read(ctx context.Context, src *storage.StorageURL) (io.ReadClo
 	return resp.Body, nil
 }
 
-// Presign returns a presigned GET URL for the object valid for expire.
+// Presign returns a presigned GET URL for the object valid for expire. The
+// URL's VersionID (when set) and the store's RequestPayer are baked into the
+// signed request.
 func (s *S3Store) Presign(ctx context.Context, from *storage.StorageURL, expire time.Duration) (string, error) {
-	req, err := s.presigner.PresignGetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(from.Bucket),
-		Key:    aws.String(from.Path),
-	}, func(o *s3.PresignOptions) {
+	input := &s3.GetObjectInput{
+		Bucket:       aws.String(from.Bucket),
+		Key:          aws.String(from.Path),
+		RequestPayer: s.requestPayer(),
+	}
+	if from.VersionID != "" {
+		input.VersionId = aws.String(from.VersionID)
+	}
+	req, err := s.presigner.PresignGetObject(ctx, input, func(o *s3.PresignOptions) {
 		o.Expires = expire
 	})
 	if err != nil {
@@ -877,7 +977,6 @@ func bytesIndexByte(b []byte, c byte) int {
 	return -1
 }
 
-
 // --- HeadObject & legacy helpers ---
 
 // HeadObject returns the generic Object and Metadata for the given URL.
@@ -961,7 +1060,11 @@ func (s *S3Store) ListObjectKeysRecursive(ctx context.Context, bucket, prefix st
 // (pass "" for recursive listing) and returns the raw types.Object and
 // types.CommonPrefix slices. Kept for cmd/ls which prints the hierarchy
 // itself.
-func (s *S3Store) ListObjectsWithPagination(ctx context.Context, bucket, key, delimiter string) ([]types.Object, []types.CommonPrefix, error) {
+//
+// pageSize > 0 is forwarded as MaxKeys (the paginator uses it as its page
+// limit); noPaginate stops after the first page so --no-paginate returns at
+// most one page of results.
+func (s *S3Store) ListObjectsWithPagination(ctx context.Context, bucket, key, delimiter string, pageSize int32, noPaginate bool) ([]types.Object, []types.CommonPrefix, error) {
 	input := &s3.ListObjectsV2Input{
 		Bucket:       aws.String(bucket),
 		Prefix:       aws.String(key),
@@ -969,6 +1072,9 @@ func (s *S3Store) ListObjectsWithPagination(ctx context.Context, bucket, key, de
 	}
 	if delimiter != "" {
 		input.Delimiter = aws.String(delimiter)
+	}
+	if pageSize > 0 {
+		input.MaxKeys = aws.Int32(pageSize)
 	}
 	paginator := s3.NewListObjectsV2Paginator(s.client, input)
 
@@ -981,33 +1087,52 @@ func (s *S3Store) ListObjectsWithPagination(ctx context.Context, bucket, key, de
 		}
 		objects = append(objects, page.Contents...)
 		prefixes = append(prefixes, page.CommonPrefixes...)
+		if noPaginate {
+			break
+		}
 	}
 	return objects, prefixes, nil
 }
 
-// DeleteObjects deletes the given keys from the bucket in a single batched
-// DeleteObjects call. Kept for the existing stringly-typed callers.
+// DeleteObjects deletes the given keys from the bucket in batched
+// DeleteObjects calls of at most deleteObjectsMax keys each (S3 rejects
+// bigger requests). Kept for the existing stringly-typed callers.
 func (s *S3Store) DeleteObjects(ctx context.Context, bucketName string, objectKeys []string) error {
 	if len(objectKeys) == 0 {
 		return nil
 	}
-	var objectIds []types.ObjectIdentifier
-	for _, key := range objectKeys {
-		objectIds = append(objectIds, types.ObjectIdentifier{Key: aws.String(key)})
+	if s.dryRun {
+		return nil
 	}
-	output, err := s.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
-		Bucket:       aws.String(bucketName),
-		Delete:       &types.Delete{Objects: objectIds, Quiet: aws.Bool(true)},
-		RequestPayer: s.requestPayer(),
-	})
-	if err != nil {
-		return err
-	}
-	if len(output.Errors) > 0 {
-		var b strings.Builder
+	var b strings.Builder
+	for start := 0; start < len(objectKeys); start += deleteObjectsMax {
+		end := start + deleteObjectsMax
+		if end > len(objectKeys) {
+			end = len(objectKeys)
+		}
+		objectIds := make([]types.ObjectIdentifier, 0, end-start)
+		for _, key := range objectKeys[start:end] {
+			objectIds = append(objectIds, types.ObjectIdentifier{Key: aws.String(key)})
+		}
+		output, err := s.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+			Bucket:       aws.String(bucketName),
+			Delete:       &types.Delete{Objects: objectIds, Quiet: aws.Bool(true)},
+			RequestPayer: s.requestPayer(),
+		}, withContentMD5)
+		if err != nil {
+			// A request-level failure must not drop the per-key errors
+			// already collected from earlier batches; return both.
+			var perKey error
+			if b.Len() > 0 {
+				perKey = errors.New(strings.TrimSuffix(b.String(), "; "))
+			}
+			return errors.Join(perKey, err)
+		}
 		for _, e := range output.Errors {
 			fmt.Fprintf(&b, "%s: %s; ", aws.ToString(e.Key), aws.ToString(e.Message))
 		}
+	}
+	if b.Len() > 0 {
 		return errors.New(strings.TrimSuffix(b.String(), "; "))
 	}
 	return nil
